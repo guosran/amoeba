@@ -14,6 +14,58 @@
 // placement, temporal order, and communication can extend the candidate
 // record without weakening the enumerate-before-score boundary.
 //
+// End-to-end ownership and data flow
+// ----------------------------------
+//
+//   Taskflow IR + architecture spec
+//                |
+//                v
+//   EnumerateAnalyticalTaskCandidatesPass
+//                |  complete, deterministic candidate JSONL
+//                v
+//   ML predictor output (task-shape cost catalogue)
+//                |
+//                v
+//   ScoreAnalyticalTaskCandidatesPass
+//                |  one score record per candidate + top-k footer
+//                v
+//   external DSE driver
+//                |  one invocation for each shortlisted candidate
+//                v
+//   MaterializeAnalyticalTaskCandidatePass -> unchanged heuristic mapper
+//
+// The passes communicate through files on purpose.  Enumeration can finish
+// before the ML service is involved, the exact search space can be archived,
+// and a shortlist can be replayed without silently regenerating a different
+// candidate set.  Each reader therefore treats its input as untrusted: schema,
+// task facts, architecture fingerprint, record order, record count, IDs, and
+// footer digest are checked before results are accepted.
+//
+// Terminology used below
+// ----------------------
+//
+// * physical shape: rectangle of CGRA instances assigned to one task, e.g.
+//   1x2 CGRAs.  This becomes taskflow.task's cgra_shape/cgra_count.
+// * mapper shape: the corresponding rectangle in the coordinate system seen
+//   by the single-task mapper.  If one CGRA is 4x4 tiles, physical 1x2 becomes
+//   mapper 4x8.
+// * task body ID: stable hash of the task computation after removing DSE and
+//   profiling attributes.  It prevents a stale ML prediction from being used
+//   after the computation changes.
+// * candidate: one ordered physical-shape choice per Taskflow task.
+// * cost query: (task name, task body ID, mapper shape).  Many candidates use
+//   the same query, so scoring memoizes it once for the whole pass invocation.
+//
+// Three non-negotiable ordering invariants implement the intended DSE:
+//
+// 1. Enumeration never sees ML scores and never truncates the search space.
+//    max-candidates is a safety limit that fails atomically; it is not pruning.
+// 2. Scoring emits a record for every frozen candidate before sorting and
+//    selecting top-k.  Unsupported task-shape pairs invalidate a candidate but
+//    do not make it disappear from the score stream.
+// 3. Materialization validates the complete manifest before changing the IR.
+//    It only writes the selected shape; it never invokes the real mapper.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Backend/Neura/NeuraBackendOptions.h"
@@ -71,6 +123,12 @@ constexpr StringLiteral kSearchScope = "shape-only-v1";
 constexpr StringLiteral kCandidateIdentity = "shape-candidate-sha256-v1";
 constexpr StringLiteral kScoreModel = "shape-only-compute-bottleneck-v1";
 
+//===----------------------------------------------------------------------===//
+// In-memory records shared by the three passes
+//===----------------------------------------------------------------------===//
+
+// One shape has two coordinate systems.  rows/cols count physical CGRAs;
+// mapperRows/mapperCols count the tiles presented to Neura's mapper.
 struct RectShape {
   int64_t rows = 1;
   int64_t cols = 1;
@@ -84,6 +142,8 @@ struct RectShape {
   }
 };
 
+// Immutable facts extracted from the current IR.  A manifest is reusable only
+// while all three values still match at the same task position.
 struct TaskFact {
   TaskflowTaskOp op;
   std::string name;
@@ -91,6 +151,9 @@ struct TaskFact {
   int64_t tripCount = 1;
 };
 
+// A candidate repeats task facts next to the chosen shape.  The redundancy is
+// intentional: it makes a JSONL record self-describing and lets the reader
+// catch a manifest replayed on a different Taskflow program.
 struct TaskShapeChoice {
   std::string task;
   std::string bodyId;
@@ -98,11 +161,14 @@ struct TaskShapeChoice {
   RectShape shape;
 };
 
+// Task order follows func.walk order and is part of candidate identity.
 struct Candidate {
   std::string id;
   SmallVector<TaskShapeChoice> choices;
 };
 
+// Header values define the finite candidate space.  The footer proves that
+// every point in that space was emitted exactly once and in canonical order.
 struct ManifestHeader {
   std::string function;
   std::string architectureFingerprint;
@@ -118,18 +184,30 @@ struct ManifestFooter {
   std::string candidateIdsSha256;
 };
 
+// ML output for one query.  A supported pair models execution as
+//
+//   startupCycles + predictedII * (tripCount - 1).
+//
+// An unsupported pair remains a valid catalogue entry so the score file can
+// explain why candidates using it were rejected.
 struct BodyShapeCost {
   double predictedII = 0.0;
   double startupCycles = 0.0;
   bool supported = false;
 };
 
+// task name distinguishes separate task instances; body ID protects semantic
+// identity; mapper shape distinguishes the spatial resource presented to ML.
 using CostKey = std::tuple<std::string, std::string, std::string>;
 
 struct RankedCandidate {
   std::string id;
   double score = 0.0;
 };
+
+//===----------------------------------------------------------------------===//
+// Stable identities and Taskflow facts
+//===----------------------------------------------------------------------===//
 
 static std::string sha256(StringRef text) {
   llvm::SHA256 hasher;
@@ -291,6 +369,9 @@ static FailureOr<int64_t> taskTripCount(TaskflowTaskOp task,
 
 static FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
                                                          std::string &error) {
+  // The ordered vector collected here is the task axis of the Cartesian
+  // product.  Duplicate names would make cost keys and replay ambiguous, so
+  // reject them before either a manifest or score file is written.
   SmallVector<TaskFact> tasks;
   llvm::StringSet<> names;
   WalkResult walkResult = func.walk([&](TaskflowTaskOp task) {
@@ -314,6 +395,14 @@ static FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
   return tasks;
 }
 
+//===----------------------------------------------------------------------===//
+// Shape space and canonical candidate encoding
+//===----------------------------------------------------------------------===//
+
+// Enumerate all factor pairs for each physical CGRA count.  Only rectangles
+// fitting the multi-CGRA grid are legal.  Shapes are ordered first by resource
+// count, then from the most square to the most elongated; this order is frozen
+// into manifest indices and must be reproduced by the reader.
 static SmallVector<RectShape>
 enumerateRectShapes(int64_t gridRows, int64_t gridCols, int64_t perCgraRows,
                     int64_t perCgraCols, int64_t maxCgrasPerTask) {
@@ -344,6 +433,8 @@ enumerateRectShapes(int64_t gridRows, int64_t gridCols, int64_t perCgraRows,
 
 static void appendIdentityField(std::string &out, StringRef key,
                                 StringRef value) {
+  // Length-prefix every value so concatenation cannot alias, e.g. ("ab", "c")
+  // and ("a", "bc") produce different byte streams before hashing.
   out += key.str();
   out += ":";
   out += std::to_string(value.size());
@@ -355,6 +446,9 @@ static void appendIdentityField(std::string &out, StringRef key,
 static std::string candidateId(StringRef function,
                                StringRef architectureFingerprint,
                                ArrayRef<TaskShapeChoice> choices) {
+  // Do not hash the pretty-printed JSON: JSON field order/whitespace are an
+  // interchange detail.  This explicit canonical stream defines exactly which
+  // semantic changes invalidate a candidate ID.
   std::string identity;
   appendIdentityField(identity, "schema", kCandidateIdentity);
   appendIdentityField(identity, "shape_policy", kShapePolicy);
@@ -409,6 +503,9 @@ static void writeJsonLine(llvm::raw_ostream &os, llvm::json::Object object) {
 static bool writeAtomically(StringRef output,
                             llvm::function_ref<bool(llvm::raw_ostream &)> body,
                             std::string &error) {
+  // A partial candidate or score file is dangerous because a downstream
+  // driver could mistake it for a pruned search space.  Always write a sibling
+  // temporary file and rename it only after the body and stream both succeed.
   if (output.empty()) {
     error = "output path is required";
     return false;
@@ -465,6 +562,8 @@ static bool samePath(StringRef lhs, StringRef rhs) {
 
 static FailureOr<func::FuncOp>
 selectTaskFunction(ModuleOp module, StringRef requested, std::string &error) {
+  // Module-level passes need an unambiguous Taskflow function.  Large modules
+  // can opt in explicitly; the common single-function case stays convenient.
   if (!requested.empty()) {
     auto function = module.lookupSymbol<func::FuncOp>(requested);
     if (!function) {
@@ -496,6 +595,14 @@ selectTaskFunction(ModuleOp module, StringRef requested, std::string &error) {
   return taskFunctions.front();
 }
 
+//===----------------------------------------------------------------------===//
+// Candidate-manifest validation and streaming
+//===----------------------------------------------------------------------===//
+
+// Manifest parsing is deliberately stricter than ordinary configuration-file
+// parsing.  The file is the boundary between exhaustive enumeration and
+// scoring/materialization; accepting an omitted or altered record here would
+// silently turn exhaustive DSE into heuristic pruning.
 static std::optional<StringRef> requiredString(const llvm::json::Object &object,
                                                StringRef key,
                                                std::string &error) {
@@ -522,6 +629,8 @@ static std::optional<int64_t> checkedPositiveProduct(int64_t lhs, int64_t rhs) {
 
 static bool parseHeader(const llvm::json::Object &object,
                         ManifestHeader &header, std::string &error) {
+  // The version strings give later extensions (fusion, tiling, temporal, ...)
+  // an explicit migration point instead of reinterpreting an old manifest.
   std::optional<StringRef> schema =
       requiredString(object, "schema_version", error);
   std::optional<StringRef> function = requiredString(object, "function", error);
@@ -632,6 +741,9 @@ static bool parseCandidate(const llvm::json::Object &object,
                            ArrayRef<TaskFact> tasks,
                            ArrayRef<RectShape> legalShapes,
                            Candidate &candidate, std::string &error) {
+  // Validation proceeds from cheap structural checks to semantic checks:
+  // current task facts, dimension arithmetic, membership in the declared
+  // shape family, and finally recomputation of the stable candidate ID.
   auto schema = requiredString(object, "schema_version", error);
   auto id = requiredString(object, "candidate_id", error);
   const llvm::json::Array *records = object.getArray("task_shapes");
@@ -760,6 +872,9 @@ static bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
                                   CandidateConsumer consume,
                                   ManifestHeader &header,
                                   ManifestFooter &footer, std::string &error) {
+  // Stream candidates rather than retaining the Cartesian product in memory.
+  // The consumer can score a record or remember a requested record, while this
+  // routine owns all completeness and provenance checks common to both uses.
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
@@ -792,6 +907,8 @@ static bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
       return false;
     }
     if (*recordType == "header") {
+      // The header must be first.  Reconstructing legalShapes from it gives us
+      // both the expected product size and the canonical mixed-radix ordering.
       if (sawHeader || count != 0 || sawFooter ||
           !parseHeader(*object, header, error) ||
           !validateHeaderTasks(*object, tasks, error)) {
@@ -818,6 +935,9 @@ static bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
       continue;
     }
     if (*recordType == "candidate") {
+      // validateCandidateAtIndex is stronger than checking IDs alone: an
+      // attacker/editor cannot remove or reorder records and then merely
+      // recompute the footer digest.
       if (!sawHeader || sawFooter) {
         error = "candidate record is outside header/footer";
         return false;
@@ -834,6 +954,8 @@ static bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
       continue;
     }
     if (*recordType == "footer") {
+      // The footer closes the stream only when the declared count, mathematically
+      // expected product size, and digest of all ordered IDs agree.
       auto schema = requiredString(*object, "schema_version", error);
       auto expectedCount = requiredInteger(*object, "candidate_count", error);
       auto digest = requiredString(*object, "candidate_ids_sha256", error);
@@ -864,10 +986,22 @@ static bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
   return true;
 }
 
+// Adapter between the scorer and the ML agent's output file.
+//
+// catalog_ is the validated, immutable set of predictions supplied by ML.
+// cache_ is the set actually requested while walking candidates.  Keeping the
+// two maps separate lets us report real hit/miss statistics and, later, replace
+// catalog lookup with an online model call without changing candidate scoring.
+// The model namespace is catalog-wide, while CostKey contains the task/body/
+// shape identity.  The architecture fingerprint and catalogue SHA are recorded
+// in the score output so results from different model/machine versions cannot
+// be confused.
 class BodyShapeCostCache {
 public:
   bool load(StringRef path, StringRef expectedFunction,
             StringRef expectedArchitectureFingerprint, std::string &error) {
+    // Validate the whole catalogue eagerly.  A duplicate or malformed entry is
+    // a producer error even if no current candidate happens to query it.
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
         llvm::MemoryBuffer::getFile(path);
     if (!buffer) {
@@ -942,6 +1076,10 @@ public:
   }
 
   const BodyShapeCost *get(const TaskShapeChoice &choice, std::string &error) {
+    // Across N candidates the same task-shape pair occurs many times.  The
+    // first request is a miss copied from catalog_; all later requests return
+    // the memoized value and count as hits.  Missing predictions are fatal:
+    // silently inventing a fallback score would make candidate ranks unsound.
     CostKey key{choice.task, choice.bodyId, choice.shape.mapperShapeId};
     auto cached = cache_.find(key);
     if (cached != cache_.end()) {
@@ -974,6 +1112,10 @@ private:
   uint64_t hits_ = 0;
   uint64_t misses_ = 0;
 };
+
+//===----------------------------------------------------------------------===//
+// Pass 1: enumerate and freeze the complete shape space
+//===----------------------------------------------------------------------===//
 
 struct EnumerateAnalyticalTaskCandidatesPass
     : public PassWrapper<EnumerateAnalyticalTaskCandidatesPass,
@@ -1011,6 +1153,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
       llvm::cl::init(4)};
 
   void runOnOperation() override {
+    // Step 1: choose the Taskflow function and reject invalid safety limits.
+    // This pass is observational with respect to IR; its only output is JSONL.
     ModuleOp module = getOperation();
     std::string error;
     FailureOr<func::FuncOp> selectedFunction =
@@ -1027,6 +1171,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
 
+    // Step 2: snapshot the semantic task facts and enumerate the single-task
+    // shape alphabet S from the physical architecture.
     FailureOr<SmallVector<TaskFact>> taskFacts = collectTaskFacts(func, error);
     if (failed(taskFacts)) {
       func.emitError() << error;
@@ -1048,6 +1194,12 @@ struct EnumerateAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
 
+    // Step 3: the complete program space is S^T for T ordered tasks.  At this
+    // shape-only layer, each task must fit the grid by itself; we intentionally
+    // do not require the sum of all task footprints to fit simultaneously,
+    // because later spatial/temporal scheduling may reuse the same CGRAs.
+    // Check the exact size before opening the output.  Reaching max-candidates
+    // is an error, never permission to keep a score-biased or prefix subset.
     uint64_t candidateCount = 1;
     for (size_t ignored = 0; ignored < taskFacts->size(); ++ignored) {
       if (candidateCount >
@@ -1065,6 +1217,10 @@ struct EnumerateAnalyticalTaskCandidatesPass
     bool wrote = writeAtomically(
         outputFile.getValue(),
         [&](llvm::raw_ostream &os) {
+          // Step 4a: the header freezes every input needed to reconstruct S^T.
+          // cost_queries is the de-duplicated domain the ML producer must
+          // answer; fixed_axes makes the intentionally unimplemented search
+          // dimensions explicit rather than leaving their meaning implicit.
           llvm::json::Object architectureRecord;
           architectureRecord["grid_rows"] =
               int64_t{architecture.getMultiCgraRows()};
@@ -1117,6 +1273,9 @@ struct EnumerateAnalyticalTaskCandidatesPass
           header["fixed_axes"] = std::move(fixedAxes);
           writeJsonLine(os, std::move(header));
 
+          // Step 4b: depth-first recursion emits the Cartesian product in
+          // task-major mixed-radix order.  No analytical value is available in
+          // this pass, so every hard-valid combination is emitted.
           llvm::SHA256 idsDigest;
           uint64_t emitted = 0;
           SmallVector<TaskShapeChoice> selected;
@@ -1144,6 +1303,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
             error = "internal candidate-count mismatch";
             return false;
           }
+          // Step 4c: close the stream with both count and ordered-ID digest.
+          // The common reader later recomputes these before scoring or replay.
           llvm::json::Object footer;
           footer["record_type"] = "footer";
           footer["schema_version"] = kCandidateSchema.str();
@@ -1163,6 +1324,10 @@ struct EnumerateAnalyticalTaskCandidatesPass
                  << "\n";
   }
 };
+
+//===----------------------------------------------------------------------===//
+// Pass 2: score every frozen candidate, then form the shortlist
+//===----------------------------------------------------------------------===//
 
 struct ScoreAnalyticalTaskCandidatesPass
     : public PassWrapper<ScoreAnalyticalTaskCandidatesPass,
@@ -1202,6 +1367,8 @@ struct ScoreAnalyticalTaskCandidatesPass
       llvm::cl::init(1)};
 
   void runOnOperation() override {
+    // Step 1: establish that IR, candidate input, ML catalogue, and score
+    // output are distinct and refer to the same function/architecture.
     ModuleOp module = getOperation();
     std::string error;
     FailureOr<func::FuncOp> selectedFunction =
@@ -1239,6 +1406,9 @@ struct ScoreAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
 
+    // ranked contains only supported candidates, but it is deliberately not
+    // sorted or truncated while readCandidateManifest is still streaming.
+    // Every candidate, including unsupported ones, first gets a score record.
     SmallVector<RankedCandidate> ranked;
     ManifestHeader manifestHeader;
     ManifestFooter manifestFooter;
@@ -1247,6 +1417,8 @@ struct ScoreAnalyticalTaskCandidatesPass
     bool wrote = writeAtomically(
         outputFile.getValue(),
         [&](llvm::raw_ostream &os) {
+          // The score header binds this ranking to the exact candidate schema,
+          // architecture, model namespace, and bytes of the ML catalogue.
           llvm::json::Object scoreHeader;
           scoreHeader["record_type"] = "header";
           scoreHeader["schema_version"] = kScoreSchema.str();
@@ -1260,6 +1432,14 @@ struct ScoreAnalyticalTaskCandidatesPass
 
           auto consume = [&](uint64_t, const Candidate &candidate,
                              std::string &consumeError) {
+            // Shape-only score for one program candidate:
+            //
+            //   duration(task) = startup + II * (trip_count - 1)
+            //   score(candidate) = max duration(task)
+            //
+            // This is only a compute bottleneck.  It must not be described as
+            // the final taskflow interval until communication and temporal
+            // scheduling are added in a later search-scope version.
             bool valid = true;
             double bottleneck = 0.0;
             std::string rejectReason;
@@ -1314,6 +1494,8 @@ struct ScoreAnalyticalTaskCandidatesPass
             return true;
           };
 
+          // readCandidateManifest invokes consume exactly once per canonical
+          // record and rejects an incomplete/reordered/tampered space.
           if (!readCandidateManifest(
                   candidateFile.getValue(), *taskFacts, func.getSymName(),
                   neura::getArchitecture(), *architectureFingerprint, consume,
@@ -1324,6 +1506,9 @@ struct ScoreAnalyticalTaskCandidatesPass
             return false;
           }
 
+          // Only now, after scoredCount equals the proven manifest count, is
+          // ranking allowed.  Candidate ID is a deterministic tie breaker, so
+          // identical scores produce a reproducible top-k across processes.
           llvm::sort(ranked, [](const RankedCandidate &lhs,
                                 const RankedCandidate &rhs) {
             if (lhs.score != rhs.score)
@@ -1343,6 +1528,10 @@ struct ScoreAnalyticalTaskCandidatesPass
             shortlist.push_back(std::move(item));
           }
 
+          // The footer is the external driver's control record.  It contains
+          // shortlist IDs to materialize and enough provenance/counts to audit
+          // that selection happened after full scoring.  The driver should run
+          // the unchanged real pipeline once for each shortlist entry.
           llvm::json::Object cacheStats;
           cacheStats["hits"] = static_cast<int64_t>(costs.hits());
           cacheStats["misses"] = static_cast<int64_t>(costs.misses());
@@ -1372,6 +1561,10 @@ struct ScoreAnalyticalTaskCandidatesPass
                  << " unique task-shape cost queries\n";
   }
 };
+
+//===----------------------------------------------------------------------===//
+// Pass 3: replay one shortlisted decision onto Taskflow IR
+//===----------------------------------------------------------------------===//
 
 struct MaterializeAnalyticalTaskCandidatePass
     : public PassWrapper<MaterializeAnalyticalTaskCandidatePass,
@@ -1408,6 +1601,9 @@ struct MaterializeAnalyticalTaskCandidatePass
       llvm::cl::init(-1)};
 
   void runOnOperation() override {
+    // Production callers should select by stable candidate-id.  Index exists
+    // for debugging/replay tools, but requiring exactly one selector prevents
+    // disagreement between two independently supplied choices.
     ModuleOp module = getOperation();
     std::string error;
     FailureOr<func::FuncOp> selectedFunction =
@@ -1438,6 +1634,10 @@ struct MaterializeAnalyticalTaskCandidatePass
       return signalPassFailure();
     }
 
+    // Do not stop reading when the requested candidate is found.  The tail of
+    // the file contains the footer/digest, and another matching record would
+    // make selection ambiguous.  We remember the match while the common reader
+    // validates the complete stream.
     std::optional<Candidate> selected;
     ManifestHeader header;
     ManifestFooter footer;
@@ -1467,8 +1667,10 @@ struct MaterializeAnalyticalTaskCandidatePass
       return signalPassFailure();
     }
 
-    // Mutation happens only after the whole manifest, checksum, current IR,
-    // architecture, and selected record have all been validated.
+    // Mutation is intentionally small and delayed until the whole manifest,
+    // checksum, current IR, architecture, and selected record are validated.
+    // cgra_count/cgra_shape configure the existing downstream heuristic mapper;
+    // no placement, route, II, or mapper result is fabricated here.
     OpBuilder builder(func.getContext());
     for (auto [task, choice] : llvm::zip(*taskFacts, selected->choices)) {
       task.op->setAttr("cgra_count",

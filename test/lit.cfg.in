@@ -11,8 +11,6 @@ config.excludes = ['samples', 'benchmark']
 # Tool substitutions from CMake
 config.substitutions.append(('mlir-amoeba-opt', '@MLIR_AMOEBA_OPT@'))
 config.substitutions.append(('FileCheck', '@FILECHECK@'))
-config.substitutions.append(('split-file', '@SPLIT_FILE@'))
-config.substitutions.append(('%not', '@LLVM_NOT@'))
 config.substitutions.append(('mlir-opt', '@MLIR_OPT@'))
 config.substitutions.append(('mlir-translate', '@MLIR_TRANSLATE@'))
 config.substitutions.append(('llc', '@LLC@'))
