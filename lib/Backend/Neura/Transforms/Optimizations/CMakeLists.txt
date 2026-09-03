@@ -1,6 +1,7 @@
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 
 add_mlir_library(MLIRAmoebaNeuraOptimizations
+  AnalyticalTaskDSEPasses.cpp
   FuseTaskPass.cpp
   ResourceAwareTaskOptimizationPass.cpp
 
@@ -8,6 +9,7 @@ add_mlir_library(MLIRAmoebaNeuraOptimizations
   MLIRAmoebaNeuraBackendPassesIncGen
 
   LINK_LIBS PUBLIC
+  MLIRAmoebaNeuraBackendOptions
   MLIRAmoebaNeuraConversion
   MLIRAmoebaNeuraTransforms
   MLIRTaskflow

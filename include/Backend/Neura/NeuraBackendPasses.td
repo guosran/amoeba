@@ -62,6 +62,94 @@ def OrchestrateTasksOnAccelerators
       "::mlir::amoeba::neura::createOrchestrateTasksOnAcceleratorsPass()";
 }
 
+def EnumerateAnalyticalTaskCandidates
+    : Pass<"enumerate-analytical-task-candidates", "ModuleOp"> {
+  let summary = "Freeze the complete rectangular task-shape candidate space";
+  let description = [{
+    Enumerates every Cartesian product of rectangular per-task CGRA shapes in
+    the declared finite shape space and writes a checksummed JSONL manifest.
+    The manifest and candidate IDs are bound to the exact architecture-spec
+    content hash.
+    This pass does not consult an analytical score, invoke Neura's mapper, or
+    modify the IR.  The initial implementation fixes fusion, fission, tiling,
+    placement, and temporal order to their identity choices; later search axes
+    extend the same manifest contract.
+  }];
+  let options = [
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Taskflow function to process; inferred when exactly one exists.">,
+    Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
+           "Path to the candidate JSONL manifest.">,
+    Option<"maxCandidates", "max-candidates", "int64_t",
+           /*default=*/"1000000",
+           "Fail instead of publishing a partial manifest above this count.">,
+    Option<"maxCgrasPerTask", "max-cgras-per-task", "int64_t",
+           /*default=*/"4",
+           "Largest rectangular physical footprint to enumerate per task.">
+  ];
+  let constructor =
+      "::mlir::amoeba::neura::createEnumerateAnalyticalTaskCandidatesPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def ScoreAnalyticalTaskCandidates
+    : Pass<"score-analytical-task-candidates", "ModuleOp"> {
+  let summary = "Score every candidate in a frozen analytical-task manifest";
+  let description = [{
+    Validates and scores every candidate from a complete manifest using a
+    versioned ML II/startup cost catalogue.  All repeated queries share one
+    (task, body ID, mapper shape, model namespace) cache.  Only after the
+    complete manifest has been consumed is the top-k shortlist emitted.  The
+    current shape-only score is explicitly a compute-bottleneck estimate, not
+    the final communication-aware pipeline interval.  The catalogue must carry
+    the same architecture fingerprint as the current compiler invocation.
+  }];
+  let options = [
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Taskflow function to process; inferred when exactly one exists.">,
+    Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
+           "Path to the frozen candidate JSONL manifest.">,
+    Option<"costFile", "cost-file", "std::string", /*default=*/"\"\"",
+           "Path to the versioned task-shape ML cost catalogue.">,
+    Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
+           "Path to the score JSONL manifest.">,
+    Option<"topK", "top-k", "int64_t", /*default=*/"1",
+           "Number of candidates to shortlist; zero means every valid one.">
+  ];
+  let constructor =
+      "::mlir::amoeba::neura::createScoreAnalyticalTaskCandidatesPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def MaterializeAnalyticalTaskCandidate
+    : Pass<"materialize-analytical-task-candidate", "ModuleOp"> {
+  let summary = "Materialize one frozen analytical task candidate";
+  let description = [{
+    Selects exactly one candidate by stable ID (or by manifest index for
+    testing) and writes its cgra_count/cgra_shape decisions to Taskflow tasks.
+    It does not invoke the mapper.  An external driver may therefore run this
+    pass followed by the unchanged heuristic mapper exactly once per top-k ID.
+  }];
+  let options = [
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Taskflow function to process; inferred when exactly one exists.">,
+    Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
+           "Path to the frozen candidate JSONL manifest.">,
+    Option<"candidateId", "candidate-id", "std::string", /*default=*/"\"\"",
+           "Stable candidate ID to materialize.">,
+    Option<"candidateIndex", "candidate-index", "int64_t", /*default=*/"-1",
+           "Zero-based manifest index; intended for tests/debugging.">
+  ];
+  let constructor =
+      "::mlir::amoeba::neura::createMaterializeAnalyticalTaskCandidatePass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def FuseTask : Pass<"fuse-task", "func::FuncOp"> {
   let summary = "Fuse Taskflow tasks using Neura profitability metrics";
   let description = [{
