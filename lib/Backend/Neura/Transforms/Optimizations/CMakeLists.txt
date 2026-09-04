@@ -1,9 +1,12 @@
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 
 add_mlir_library(MLIRAmoebaNeuraOptimizations
-  AnalyticalTaskDSEPasses.cpp
+  AnalyticalTaskDSESupport.cpp
+  EnumerateAnalyticalTaskCandidatesPass.cpp
   FuseTaskPass.cpp
+  MaterializeAnalyticalTaskCandidatePass.cpp
   ResourceAwareTaskOptimizationPass.cpp
+  ScoreAnalyticalTaskCandidatesPass.cpp
 
   DEPENDS
   MLIRAmoebaNeuraBackendPassesIncGen
