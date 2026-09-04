@@ -1,6 +1,6 @@
 //===- AnalyticalTaskDSESupport.cpp - Shared task DSE support ------------===//
 //
-// Implements the internal records and file protocol shared by the analytical
+// Implements the records and file protocol shared by the static analytical
 // task-DSE passes.
 //
 //===----------------------------------------------------------------------===//
@@ -11,12 +11,10 @@
 #include "Backend/Neura/Orchestration/orchestration_utils.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
 
-#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LineIterator.h"
@@ -26,8 +24,10 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <system_error>
+#include <tuple>
 #include <utility>
 
 using namespace mlir;
@@ -38,86 +38,17 @@ namespace amoeba {
 namespace neura {
 namespace analytical_dse {
 
-std::string RectShape::irAttr() const {
+// Converts the physical CGRA rectangle into the string stored in the
+// Taskflow `cgra_shape` attribute, such as `1x2`.
+std::string RectShape::toCgraShapeAttrValue() const {
   return std::to_string(rows) + "x" + std::to_string(cols);
 }
 
-std::string sha256Hex(StringRef text) {
-  llvm::SHA256 hasher;
-  hasher.update(text);
-  return llvm::toHex(hasher.final(), /*LowerCase=*/true);
-}
-
-void updateCandidateIdDigest(llvm::SHA256 &hasher, StringRef candidateId) {
-  hasher.update(candidateId);
-  hasher.update("\n");
-}
-
-// Binds every manifest and task-shape cost catalogue to the exact architecture
-// specification selected by the Amoeba driver. Hashing the file intentionally
-// invalidates stale scores after even semantically equivalent edits.
-FailureOr<std::string> currentArchitectureFingerprint(std::string &error) {
-  StringRef path = mlir::amoeba::getNeuraArchitectureSpecFile();
-  if (path.empty()) {
-    error = "analytical task DSE requires --architecture-spec";
-    return failure();
-  }
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-      llvm::MemoryBuffer::getFile(path);
-  if (!buffer) {
-    error = "cannot fingerprint architecture specification " + path.str() +
-            ": " + buffer.getError().message();
-    return failure();
-  }
-  return "sha256:" + sha256Hex((*buffer)->getBuffer());
-}
-
-// Matches frontend_model.shapes: the mapper ID names the exact tile mask, not
-// just its bounding box.  For rectangles the mask is the whole tile array.
-static std::string mapperShapeId(int64_t rows, int64_t cols) {
-  std::string canonical = "[";
-  bool first = true;
-  for (int64_t row = 0; row < rows; ++row) {
-    for (int64_t col = 0; col < cols; ++col) {
-      if (!first)
-        canonical += ",";
-      first = false;
-      canonical += "{\"col\":" + std::to_string(col) +
-                   ",\"row\":" + std::to_string(row) + "}";
-    }
-  }
-  canonical += "]";
-  return std::to_string(rows) + "x" + std::to_string(cols) + "-" +
-         sha256Hex(canonical).substr(0, 10);
-}
-
-static std::string taskBodyId(TaskflowTaskOp task) {
-  if (auto explicitId = task->getAttrOfType<StringAttr>("analytical_body_id"))
-    if (!explicitId.getValue().empty())
-      return explicitId.getValue().str();
-
-  // Hashes the computation and interface without transient decisions or
-  // measurements. This preserves reuse of the same task-shape query after
-  // materialization or profiling.
-  Operation *clone = task->clone();
-  auto destroyClone = llvm::make_scope_exit([&] { clone->destroy(); });
-  clone->setAttr("task_name",
-                 StringAttr::get(task.getContext(), "__analytical_body__"));
-  for (StringRef attr :
-       {"analytical_body_id", "trip_count", "cgra_count", "cgra_shape",
-        "compiled_ii", "profile_info", "task_orchestration_info", "replicas",
-        "tiling", "est_latency"})
-    clone->removeAttr(attr);
-  std::string printed;
-  llvm::raw_string_ostream os(printed);
-  OpPrintingFlags flags;
-  flags.printGenericOpForm().useLocalScope();
-  clone->print(os, flags);
-  os.flush();
-  return "sha256:" + sha256Hex(printed);
-}
-
-// Resolves an explicit trip count before consulting shared counter analysis.
+// Resolves the trip count that analytical DSE stores with each task. An
+// explicit positive `trip_count` is authoritative; otherwise, a static
+// Taskflow counter chain supplies the count. A task with no Taskflow counter
+// represents one execution at this layer, while a dynamic or invalid counter
+// fails because treating it as one would produce an incorrect score.
 static FailureOr<int64_t> taskTripCount(TaskflowTaskOp task,
                                         std::string &error) {
   if (auto attr = task->getAttrOfType<IntegerAttr>("trip_count")) {
@@ -130,18 +61,21 @@ static FailureOr<int64_t> taskTripCount(TaskflowTaskOp task,
   }
 
   FailureOr<std::optional<int64_t>> inferred =
-      computeTaskflowCounterTripCount(task, error);
+      inferStaticTaskTripCount(task, error);
   if (failed(inferred)) {
-    error += "; add an explicit trip_count";
+    error += "; add an explicit positive trip_count or resolve the counter "
+             "bounds first";
     return failure();
   }
+  // A task without a Taskflow counter executes once in the task-level model.
   return inferred->value_or(1);
 }
 
+// Collects task names, operations, and static trip counts in walk order. The
+// order is the task axis used by the candidate Cartesian product, so duplicate
+// names are rejected before they can make a cost lookup ambiguous.
 FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
                                                   std::string &error) {
-  // Collects the task axis of the Cartesian product in deterministic order.
-  // Rejects duplicate names before they make cost keys or replay ambiguous.
   SmallVector<TaskFact> tasks;
   llvm::StringSet<> names;
   WalkResult walkResult = func.walk([&](TaskflowTaskOp task) {
@@ -153,7 +87,7 @@ FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
     FailureOr<int64_t> tripCount = taskTripCount(task, error);
     if (failed(tripCount))
       return WalkResult::interrupt();
-    tasks.push_back({task, std::move(name), taskBodyId(task), *tripCount});
+    tasks.push_back({task, std::move(name), *tripCount});
     return WalkResult::advance();
   });
   if (walkResult.wasInterrupted())
@@ -165,82 +99,79 @@ FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
   return tasks;
 }
 
-//===----------------------------------------------------------------------===//
-// Shape space and canonical candidate encoding
-//===----------------------------------------------------------------------===//
+// Formats a mapper tile rectangle as its stable, human-readable key. A
+// physical 1x2 shape on a 4x4-tile CGRA therefore becomes `rect-4x8`.
+static std::string toMapperShapeString(int64_t mapperRows, int64_t mapperCols) {
+  return "rect-" + std::to_string(mapperRows) + "x" +
+         std::to_string(mapperCols);
+}
 
-// Extends the shared physical-shape enumeration with mapper dimensions.
-SmallVector<RectShape> enumerateRectShapes(int64_t gridRows, int64_t gridCols,
-                                           int64_t perCgraRows,
-                                           int64_t perCgraCols,
-                                           int64_t maxCgrasPerTask) {
+// Enumerates every legal static physical rectangle and derives its mapper
+// dimensions from the architecture getters. The order is deterministic and
+// is later used as the mixed-radix alphabet for candidate IDs and validation.
+SmallVector<RectShape> enumerateStaticRectShapes(int64_t gridRows,
+                                                 int64_t gridCols,
+                                                 int64_t perCgraRows,
+                                                 int64_t perCgraCols,
+                                                 int64_t maxCgrasPerTask) {
   SmallVector<RectShape> result;
-  const int64_t maxCount = std::min(maxCgrasPerTask, gridRows * gridCols);
+  if (gridRows <= 0 || gridCols <= 0 || perCgraRows <= 0 || perCgraCols <= 0 ||
+      maxCgrasPerTask <= 0)
+    return result;
+
+  const int64_t gridSize =
+      gridRows > std::numeric_limits<int64_t>::max() / gridCols
+          ? std::numeric_limits<int64_t>::max()
+          : gridRows * gridCols;
+  const int64_t maxCount = std::min(maxCgrasPerTask, gridSize);
   for (int64_t count = 1; count <= maxCount; ++count) {
     for (const CgraShape &physicalShape : taskflow::getRectangularShapes(
-             count, static_cast<int>(gridRows), static_cast<int>(gridCols))) {
+             static_cast<int>(count), static_cast<int>(gridRows),
+             static_cast<int>(gridCols))) {
+      if (physicalShape.rows >
+              std::numeric_limits<int64_t>::max() / perCgraRows ||
+          physicalShape.cols >
+              std::numeric_limits<int64_t>::max() / perCgraCols)
+        continue;
       int64_t mapperRows = physicalShape.rows * perCgraRows;
       int64_t mapperCols = physicalShape.cols * perCgraCols;
-      result.push_back({physicalShape.rows, physicalShape.cols, mapperRows,
-                        mapperCols, mapperShapeId(mapperRows, mapperCols)});
+      result.push_back(
+          {physicalShape.rows, physicalShape.cols, mapperRows, mapperCols});
     }
   }
   return result;
 }
 
-static void appendIdentityField(std::string &out, StringRef key,
-                                StringRef value) {
-  // Length-prefixes every value so concatenation cannot alias, for example,
-  // ("ab", "c") and ("a", "bc") produce different byte streams.
-  out += key.str();
-  out += ":";
-  out += std::to_string(value.size());
-  out += ":";
-  out += value.str();
-  out += "\n";
+// Formats the deterministic candidate ID assigned by enumeration. For
+// example, the first candidate is `candidate-0`, and the next is
+// `candidate-1`; the numeric suffix is the canonical mixed-radix index.
+std::string makeSequentialCandidateId(uint64_t index) {
+  return "candidate-" + std::to_string(index);
 }
 
-std::string makeCandidateId(StringRef function,
-                            StringRef architectureFingerprint,
-                            ArrayRef<TaskShapeChoice> choices) {
-  // Hashes an explicit canonical stream because JSON field order and
-  // whitespace are interchange details. This defines which semantic changes
-  // invalidate a candidate ID.
-  std::string identity;
-  appendIdentityField(identity, "schema", kCandidateIdentity);
-  appendIdentityField(identity, "shape_policy", kShapePolicy);
-  appendIdentityField(identity, "function", function);
-  appendIdentityField(identity, "architecture", architectureFingerprint);
-  for (const TaskShapeChoice &choice : choices) {
-    appendIdentityField(identity, "task", choice.task);
-    appendIdentityField(identity, "body_id", choice.bodyId);
-    appendIdentityField(identity, "trip_count",
-                        std::to_string(choice.tripCount));
-    appendIdentityField(identity, "physical_shape", choice.shape.irAttr());
-    appendIdentityField(identity, "mapper_shape", choice.shape.mapperShapeId);
-  }
-  return sha256Hex(identity);
-}
-
+// Serializes the shape fields used by candidate records. The explicit tile
+// dimensions are the only mapper-shape truth; a `rect-4x8` string is produced
+// only for diagnostics when needed.
 static llvm::json::Object shapeJson(const RectShape &shape) {
   llvm::json::Object object;
   object["kind"] = "rect";
   object["rows"] = shape.rows;
   object["cols"] = shape.cols;
   object["cgra_count"] = shape.cgraCount();
-  object["cgra_shape"] = shape.irAttr();
+  object["cgra_shape"] = shape.toCgraShapeAttrValue();
   object["mapper_tile_rows"] = shape.mapperRows;
   object["mapper_tile_cols"] = shape.mapperCols;
-  object["mapper_shape_id"] = shape.mapperShapeId;
   return object;
 }
 
+// Serializes one candidate while preserving task order. The candidate ID is a
+// sequential index, so no task-body identity or file-derived metadata is
+// required to interpret it within its validated v2 manifest.
 llvm::json::Object candidateJson(const Candidate &candidate) {
   llvm::json::Array choices;
   for (const TaskShapeChoice &choice : candidate.choices) {
     llvm::json::Object record;
     record["task"] = choice.task;
-    record["body_id"] = choice.bodyId;
     record["trip_count"] = choice.tripCount;
     record["shape"] = shapeJson(choice.shape);
     choices.push_back(std::move(record));
@@ -253,15 +184,16 @@ llvm::json::Object candidateJson(const Candidate &candidate) {
   return record;
 }
 
+// Writes one JSON object as a single JSONL record.
 void writeJsonLine(llvm::raw_ostream &os, llvm::json::Object object) {
   os << llvm::json::Value(std::move(object)) << "\n";
 }
 
+// Publishes a complete output atomically so a downstream pass never reads a
+// partially enumerated or partially scored file.
 bool writeAtomically(StringRef output,
                      llvm::function_ref<bool(llvm::raw_ostream &)> writeBody,
                      std::string &error) {
-  // Prevents a downstream driver from mistaking a partial file for a pruned
-  // search space. Writes a sibling temporary and renames it only after success.
   if (output.empty()) {
     error = "output path is required";
     return false;
@@ -301,6 +233,8 @@ bool writeAtomically(StringRef output,
   return true;
 }
 
+// Normalizes a path for the output-collision check while tolerating paths that
+// do not exist yet.
 static SmallString<256> normalizedPath(StringRef path) {
   SmallString<256> result(path);
   if (std::error_code ec = llvm::sys::fs::make_absolute(result))
@@ -309,6 +243,7 @@ static SmallString<256> normalizedPath(StringRef path) {
   return result;
 }
 
+// Checks whether two paths identify the same file or normalized pathname.
 bool samePath(StringRef lhs, StringRef rhs) {
   bool equivalent = false;
   if (!llvm::sys::fs::equivalent(lhs, rhs, equivalent) && equivalent)
@@ -316,10 +251,10 @@ bool samePath(StringRef lhs, StringRef rhs) {
   return normalizedPath(lhs) == normalizedPath(rhs);
 }
 
+// Selects the requested Taskflow function, or infers it when exactly one
+// function contains tasks. This keeps every file-producing pass consistent.
 FailureOr<func::FuncOp> selectTaskFunction(ModuleOp module, StringRef requested,
                                            std::string &error) {
-  // Requires an unambiguous Taskflow function for module-level passes. Allows
-  // explicit selection while keeping the single-function case convenient.
   if (!requested.empty()) {
     auto function = module.lookupSymbol<func::FuncOp>(requested);
     if (!function) {
@@ -351,13 +286,7 @@ FailureOr<func::FuncOp> selectTaskFunction(ModuleOp module, StringRef requested,
   return taskFunctions.front();
 }
 
-//===----------------------------------------------------------------------===//
-// Candidate-manifest validation and streaming
-//===----------------------------------------------------------------------===//
-
-// Enforces stricter validation than ordinary configuration-file parsing. The
-// manifest separates exhaustive enumeration from scoring and materialization,
-// so accepting altered records would silently introduce heuristic pruning.
+// Reads a required JSON string and reports a field-specific error.
 static std::optional<StringRef> requiredString(const llvm::json::Object &object,
                                                StringRef key,
                                                std::string &error) {
@@ -367,6 +296,7 @@ static std::optional<StringRef> requiredString(const llvm::json::Object &object,
   return value;
 }
 
+// Reads a required JSON integer and reports a field-specific error.
 static std::optional<int64_t> requiredInteger(const llvm::json::Object &object,
                                               StringRef key,
                                               std::string &error) {
@@ -376,16 +306,18 @@ static std::optional<int64_t> requiredInteger(const llvm::json::Object &object,
   return value;
 }
 
+// Multiplies two positive counts while detecting overflow before the product.
 static std::optional<int64_t> checkedPositiveProduct(int64_t lhs, int64_t rhs) {
   if (lhs <= 0 || rhs <= 0 || lhs > std::numeric_limits<int64_t>::max() / rhs)
     return std::nullopt;
   return lhs * rhs;
 }
 
+// Parses the v2 manifest header, including the explicit architecture
+// dimensions that describe how physical CGRAs map to tiles. The dimensions
+// are later compared directly with `getArchitecture()` getters.
 static bool parseHeader(const llvm::json::Object &object,
                         ManifestHeader &header, std::string &error) {
-  // Gives later extensions an explicit migration point through versioned
-  // schemas instead of reinterpreting an old manifest.
   std::optional<StringRef> schema =
       requiredString(object, "schema_version", error);
   std::optional<StringRef> function = requiredString(object, "function", error);
@@ -393,43 +325,34 @@ static bool parseHeader(const llvm::json::Object &object,
       requiredString(object, "search_scope", error);
   std::optional<StringRef> policy =
       requiredString(object, "shape_policy", error);
-  std::optional<StringRef> identity =
-      requiredString(object, "candidate_identity", error);
   const llvm::json::Object *architecture = object.getObject("architecture");
-  if (!schema || !function || !scope || !policy || !identity || !architecture)
+  if (!schema || !function || !scope || !policy || !architecture)
     return false;
   if (*schema != kCandidateSchema || *scope != kSearchScope ||
-      *policy != kShapePolicy || *identity != kCandidateIdentity) {
+      *policy != kShapePolicy) {
     error = "unsupported candidate manifest contract";
     return false;
   }
+
   auto gridRows = requiredInteger(*architecture, "grid_rows", error);
   auto gridCols = requiredInteger(*architecture, "grid_cols", error);
   auto perRows = requiredInteger(*architecture, "per_cgra_tile_rows", error);
   auto perCols = requiredInteger(*architecture, "per_cgra_tile_cols", error);
-  auto fingerprint = requiredString(*architecture, "spec_fingerprint", error);
   auto maxCgras = requiredInteger(object, "max_cgras_per_task", error);
-  if (!gridRows || !gridCols || !perRows || !perCols || !fingerprint ||
-      !maxCgras)
+  if (!gridRows || !gridCols || !perRows || !perCols || !maxCgras)
     return false;
-  header = {function->str(), fingerprint->str(), *gridRows, *gridCols,
-            *perRows,        *perCols,           *maxCgras};
+  header = {function->str(), *gridRows, *gridCols,
+            *perRows,        *perCols,  *maxCgras};
   if (header.gridRows <= 0 || header.gridCols <= 0 || header.perCgraRows <= 0 ||
       header.perCgraCols <= 0 || header.maxCgrasPerTask <= 0) {
     error = "candidate manifest dimensions must be positive";
     return false;
   }
-  StringRef fingerprintValue(header.architectureFingerprint);
-  if (!fingerprintValue.consume_front("sha256:") ||
-      fingerprintValue.size() != 64 ||
-      llvm::any_of(fingerprintValue,
-                   [](char value) { return !llvm::isHexDigit(value); })) {
-    error = "candidate manifest architecture fingerprint is invalid";
-    return false;
-  }
   return true;
 }
 
+// Verifies that the manifest task list has the same names and static trip
+// counts as the current IR.
 static bool validateHeaderTasks(const llvm::json::Object &object,
                                 ArrayRef<TaskFact> tasks, std::string &error) {
   const llvm::json::Array *records = object.getArray("tasks");
@@ -444,12 +367,10 @@ static bool validateHeaderTasks(const llvm::json::Object &object,
       return false;
     }
     auto name = requiredString(*record, "task", error);
-    auto bodyId = requiredString(*record, "body_id", error);
     auto tripCount = requiredInteger(*record, "trip_count", error);
-    if (!name || !bodyId || !tripCount)
+    if (!name || !tripCount)
       return false;
-    if (*name != tasks[index].name || *bodyId != tasks[index].bodyId ||
-        *tripCount != tasks[index].tripCount) {
+    if (*name != tasks[index].name || *tripCount != tasks[index].tripCount) {
       error = "candidate manifest header task facts do not match current IR";
       return false;
     }
@@ -457,6 +378,8 @@ static bool validateHeaderTasks(const llvm::json::Object &object,
   return true;
 }
 
+// Parses one rectangular shape and checks its redundant fields against the
+// dimensions. The explicit tile rows and columns are the mapper-shape truth.
 static bool parseShape(const llvm::json::Object &object, RectShape &shape,
                        std::string &error) {
   auto kind = requiredString(object, "kind", error);
@@ -466,9 +389,8 @@ static bool parseShape(const llvm::json::Object &object, RectShape &shape,
   auto irShape = requiredString(object, "cgra_shape", error);
   auto mapperRows = requiredInteger(object, "mapper_tile_rows", error);
   auto mapperCols = requiredInteger(object, "mapper_tile_cols", error);
-  auto mapperId = requiredString(object, "mapper_shape_id", error);
   if (!kind || !rows || !cols || !count || !irShape || !mapperRows ||
-      !mapperCols || !mapperId)
+      !mapperCols)
     return false;
   std::optional<int64_t> computedCount = checkedPositiveProduct(*rows, *cols);
   if (*kind != "rect" || !computedCount || *count != *computedCount ||
@@ -476,28 +398,26 @@ static bool parseShape(const llvm::json::Object &object, RectShape &shape,
     error = "candidate contains a non-rectangular or invalid shape";
     return false;
   }
-  shape = {*rows, *cols, *mapperRows, *mapperCols, mapperId->str()};
-  if (*irShape != shape.irAttr()) {
-    error = "candidate shape identifier does not match its dimensions";
+  shape = {*rows, *cols, *mapperRows, *mapperCols};
+  if (*irShape != shape.toCgraShapeAttrValue()) {
+    error = "candidate physical shape label does not match its dimensions";
     return false;
   }
   return true;
 }
 
+// Compares the physical and mapper dimensions of two rectangles.
 static bool sameShape(const RectShape &lhs, const RectShape &rhs) {
-  return std::tie(lhs.rows, lhs.cols, lhs.mapperRows, lhs.mapperCols,
-                  lhs.mapperShapeId) == std::tie(rhs.rows, rhs.cols,
-                                                 rhs.mapperRows, rhs.mapperCols,
-                                                 rhs.mapperShapeId);
+  return std::tie(lhs.rows, lhs.cols, lhs.mapperRows, lhs.mapperCols) ==
+         std::tie(rhs.rows, rhs.cols, rhs.mapperRows, rhs.mapperCols);
 }
 
+// Parses one candidate record and verifies task names and static trip counts.
+// Candidate ordering and the sequential ID are checked by the stream reader,
+// which knows the record's canonical mixed-radix index.
 static bool parseCandidate(const llvm::json::Object &object,
-                           const ManifestHeader &header,
-                           ArrayRef<TaskFact> tasks,
-                           ArrayRef<RectShape> legalShapes,
-                           Candidate &candidate, std::string &error) {
-  // Proceeds from cheap structural validation to task facts, dimension
-  // arithmetic, shape-family membership, and stable-ID recomputation.
+                           ArrayRef<TaskFact> tasks, Candidate &candidate,
+                           std::string &error) {
   auto schema = requiredString(object, "schema_version", error);
   auto id = requiredString(object, "candidate_id", error);
   const llvm::json::Array *records = object.getArray("task_shapes");
@@ -508,6 +428,7 @@ static bool parseCandidate(const llvm::json::Object &object,
     return false;
   }
 
+  candidate.id = id->str();
   candidate.choices.clear();
   for (auto [index, value] : llvm::enumerate(*records)) {
     const llvm::json::Object *record = value.getAsObject();
@@ -516,45 +437,24 @@ static bool parseCandidate(const llvm::json::Object &object,
       return false;
     }
     auto taskName = requiredString(*record, "task", error);
-    auto bodyId = requiredString(*record, "body_id", error);
     auto tripCount = requiredInteger(*record, "trip_count", error);
     const llvm::json::Object *shapeObject = record->getObject("shape");
-    if (!taskName || !bodyId || !tripCount || !shapeObject)
+    if (!taskName || !tripCount || !shapeObject)
       return false;
     const TaskFact &task = tasks[index];
-    if (*taskName != task.name || *bodyId != task.bodyId ||
-        *tripCount != task.tripCount) {
+    if (*taskName != task.name || *tripCount != task.tripCount) {
       error = "candidate task facts do not match the current IR";
       return false;
     }
     RectShape shape;
     if (!parseShape(*shapeObject, shape, error))
       return false;
-    std::optional<int64_t> expectedMapperRows =
-        checkedPositiveProduct(shape.rows, header.perCgraRows);
-    std::optional<int64_t> expectedMapperCols =
-        checkedPositiveProduct(shape.cols, header.perCgraCols);
-    if (!expectedMapperRows || !expectedMapperCols ||
-        shape.mapperRows != *expectedMapperRows ||
-        shape.mapperCols != *expectedMapperCols ||
-        llvm::none_of(legalShapes, [&](const RectShape &item) {
-          return sameShape(item, shape);
-        })) {
-      error = "candidate shape is outside the declared rectangular space";
-      return false;
-    }
-    candidate.choices.push_back(
-        {task.name, task.bodyId, task.tripCount, std::move(shape)});
-  }
-  candidate.id = makeCandidateId(
-      header.function, header.architectureFingerprint, candidate.choices);
-  if (*id != candidate.id) {
-    error = "candidate_id does not match canonical candidate content";
-    return false;
+    candidate.choices.push_back({task.name, task.tripCount, std::move(shape)});
   }
   return true;
 }
 
+// Computes the expected size of the task-shape Cartesian product.
 static FailureOr<uint64_t> expectedCandidateCount(size_t shapeCount,
                                                   size_t taskCount,
                                                   std::string &error) {
@@ -573,13 +473,17 @@ static FailureOr<uint64_t> expectedCandidateCount(size_t shapeCount,
   return result;
 }
 
-// Treats enumeration order as part of the frozen contract. Checking the exact
-// record at each index detects omissions, duplicates, and reorderings even when
-// an editor recomputes the footer digest.
+// Verifies the canonical mixed-radix shape assignment at one candidate index.
+// The last task changes fastest, so index 1 for two tasks means
+// `(task0=shape0, task1=shape1)`.
 static bool validateCandidateAtIndex(uint64_t index, ArrayRef<TaskFact> tasks,
                                      ArrayRef<RectShape> shapes,
                                      const Candidate &candidate,
                                      std::string &error) {
+  if (candidate.id != makeSequentialCandidateId(index)) {
+    error = "candidate ID does not match its canonical manifest index";
+    return false;
+  }
   SmallVector<size_t> shapeIndices(tasks.size());
   uint64_t remainder = index;
   for (size_t reverse = tasks.size(); reverse > 0; --reverse) {
@@ -600,33 +504,32 @@ static bool validateCandidateAtIndex(uint64_t index, ArrayRef<TaskFact> tasks,
   return true;
 }
 
-using CandidateConsumer =
-    llvm::function_ref<bool(uint64_t, const Candidate &, std::string &)>;
-
+// Compares manifest architecture dimensions directly with the current
+// architecture object. Reading architecture.yaml uses these getters; no file
+// fingerprint or other file-derived metadata is needed for this protocol.
 static bool architectureMatches(const ManifestHeader &header,
                                 const ::mlir::neura::Architecture &architecture,
-                                StringRef currentFingerprint,
                                 std::string &error) {
   if (header.gridRows != architecture.getMultiCgraRows() ||
       header.gridCols != architecture.getMultiCgraColumns() ||
       header.perCgraRows != architecture.getPerCgraRows() ||
-      header.perCgraCols != architecture.getPerCgraColumns() ||
-      header.architectureFingerprint != currentFingerprint) {
-    error = "candidate manifest architecture does not match current Neura "
-            "architecture";
+      header.perCgraCols != architecture.getPerCgraColumns()) {
+    error = "candidate manifest architecture dimensions do not match current "
+            "Neura architecture";
     return false;
   }
   return true;
 }
 
+// Streams and validates a complete candidate manifest before forwarding each
+// candidate to the scoring or materialization callback. The footer verifies
+// both the emitted count and the mathematically expected Cartesian-product
+// size; every candidate verifies its sequential ID and mixed-radix shape.
 bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
                            StringRef expectedFunction,
                            const ::mlir::neura::Architecture &architecture,
-                           StringRef architectureFingerprint,
                            CandidateConsumer consume, ManifestHeader &header,
                            ManifestFooter &footer, std::string &error) {
-  // Streams candidates instead of retaining the Cartesian product in memory.
-  // Gives the common reader ownership of completeness and provenance checks.
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
@@ -640,7 +543,6 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
   uint64_t count = 0;
   uint64_t declaredSpaceCount = 0;
   SmallVector<RectShape> legalShapes;
-  llvm::SHA256 idsDigest;
   for (llvm::line_iterator lines(**buffer, /*SkipBlanks=*/true);
        !lines.is_at_end(); ++lines) {
     llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(*lines);
@@ -659,8 +561,6 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
       return false;
     }
     if (*recordType == "header") {
-      // Requires the header first and reconstructs both the expected product
-      // size and canonical mixed-radix ordering from it.
       if (sawHeader || count != 0 || sawFooter ||
           !parseHeader(*object, header, error) ||
           !validateHeaderTasks(*object, tasks, error)) {
@@ -672,12 +572,11 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
         error = "candidate manifest function does not match current IR";
         return false;
       }
-      if (!architectureMatches(header, architecture, architectureFingerprint,
-                               error))
+      if (!architectureMatches(header, architecture, error))
         return false;
-      legalShapes = enumerateRectShapes(header.gridRows, header.gridCols,
-                                        header.perCgraRows, header.perCgraCols,
-                                        header.maxCgrasPerTask);
+      legalShapes = enumerateStaticRectShapes(
+          header.gridRows, header.gridCols, header.perCgraRows,
+          header.perCgraCols, header.maxCgrasPerTask);
       FailureOr<uint64_t> computed =
           expectedCandidateCount(legalShapes.size(), tasks.size(), error);
       if (failed(computed))
@@ -687,43 +586,35 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
       continue;
     }
     if (*recordType == "candidate") {
-      // Prevents an editor from removing or reordering records and merely
-      // recomputing the digest by validating each candidate at its index.
       if (!sawHeader || sawFooter) {
         error = "candidate record is outside header/footer";
         return false;
       }
       Candidate candidate;
-      if (!parseCandidate(*object, header, tasks, legalShapes, candidate,
-                          error) ||
+      if (!parseCandidate(*object, tasks, candidate, error) ||
           !validateCandidateAtIndex(count, tasks, legalShapes, candidate,
                                     error) ||
           !consume(count, candidate, error))
         return false;
-      updateCandidateIdDigest(idsDigest, candidate.id);
       ++count;
       continue;
     }
     if (*recordType == "footer") {
-      // Closes the stream only when its count, expected product size, and
-      // ordered-ID digest agree.
       auto schema = requiredString(*object, "schema_version", error);
       auto expectedCount = requiredInteger(*object, "candidate_count", error);
-      auto digest = requiredString(*object, "candidate_ids_sha256", error);
-      if (!sawHeader || sawFooter || !schema || !expectedCount || !digest ||
+      if (!sawHeader || sawFooter || !schema || !expectedCount ||
           *schema != kCandidateSchema || *expectedCount < 0) {
         if (error.empty())
           error = "invalid candidate manifest footer";
         return false;
       }
-      std::string actualDigest =
-          llvm::toHex(idsDigest.final(), /*LowerCase=*/true);
       if (static_cast<uint64_t>(*expectedCount) != count ||
-          count != declaredSpaceCount || *digest != actualDigest) {
-        error = "candidate manifest count/digest mismatch";
+          count != declaredSpaceCount) {
+        error = "candidate manifest count does not match its declared shape "
+                "space";
         return false;
       }
-      footer = {count, actualDigest};
+      footer = {count};
       sawFooter = true;
       continue;
     }
@@ -737,11 +628,11 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
   return true;
 }
 
-bool BodyShapeCostCache::load(StringRef path, StringRef expectedFunction,
-                              StringRef expectedArchitectureFingerprint,
+// Loads and validates the v2 task-shape cost catalogue. Each entry is keyed by
+// task name and explicit mapper tile dimensions, so a `rect-4x8` label remains
+// readable without becoming a correctness dependency.
+bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
                               std::string &error) {
-  // Validates the entire catalogue eagerly, including unused entries, because
-  // duplicates and malformed predictions indicate a producer error.
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
@@ -756,7 +647,6 @@ bool BodyShapeCostCache::load(StringRef path, StringRef expectedFunction,
         "invalid cost catalogue JSON: " + llvm::toString(parsed.takeError());
     return false;
   }
-  catalogSha256_ = sha256Hex((*buffer)->getBuffer());
   llvm::json::Object *root = parsed->getAsObject();
   if (!root) {
     error = "cost catalogue must be a JSON object";
@@ -765,20 +655,20 @@ bool BodyShapeCostCache::load(StringRef path, StringRef expectedFunction,
   auto schema = requiredString(*root, "schema_version", error);
   auto function = requiredString(*root, "function", error);
   auto modelNamespace = requiredString(*root, "namespace", error);
-  auto architectureFingerprint =
-      requiredString(*root, "architecture_fingerprint", error);
   llvm::json::Array *entries = root->getArray("entries");
-  if (!schema || !function || !modelNamespace || !architectureFingerprint ||
-      !entries)
+  if (!schema || !function || !modelNamespace || !entries)
     return false;
   if (*schema != kCostSchema || *function != expectedFunction ||
-      modelNamespace->empty() ||
-      *architectureFingerprint != expectedArchitectureFingerprint) {
-    error = "cost catalogue schema/function/namespace/architecture mismatch";
+      modelNamespace->empty()) {
+    error = "cost catalogue schema/function/namespace mismatch";
     return false;
   }
-  namespace_ = modelNamespace->str();
 
+  namespace_ = modelNamespace->str();
+  catalog_.clear();
+  cache_.clear();
+  hits_ = 0;
+  misses_ = 0;
   for (llvm::json::Value &value : *entries) {
     llvm::json::Object *entry = value.getAsObject();
     if (!entry) {
@@ -786,12 +676,16 @@ bool BodyShapeCostCache::load(StringRef path, StringRef expectedFunction,
       return false;
     }
     auto task = requiredString(*entry, "task", error);
-    auto bodyId = requiredString(*entry, "body_id", error);
-    auto mapperShape = requiredString(*entry, "mapper_shape_id", error);
+    auto mapperRows = requiredInteger(*entry, "mapper_tile_rows", error);
+    auto mapperCols = requiredInteger(*entry, "mapper_tile_cols", error);
     auto status = requiredString(*entry, "support_status", error);
-    if (!task || !bodyId || !mapperShape || !status)
+    if (!task || !mapperRows || !mapperCols || !status)
       return false;
-    BodyShapeCost cost;
+    if (*mapperRows <= 0 || *mapperCols <= 0) {
+      error = "cost entry mapper tile dimensions must be positive";
+      return false;
+    }
+    TaskShapeCost cost;
     if (*status == "supported") {
       auto ii = entry->getNumber("predicted_ii");
       auto startup = entry->getNumber("startup_cycles");
@@ -806,20 +700,20 @@ bool BodyShapeCostCache::load(StringRef path, StringRef expectedFunction,
       error = "support_status must be supported or unsupported";
       return false;
     }
-    CostKey key{task->str(), bodyId->str(), mapperShape->str()};
+    CostKey key{task->str(), *mapperRows, *mapperCols};
     if (!catalog_.emplace(std::move(key), cost).second) {
-      error = "duplicate task/shape cost entry";
+      error = "duplicate task/mapper-shape cost entry";
       return false;
     }
   }
   return true;
 }
 
-const BodyShapeCost *BodyShapeCostCache::get(const TaskShapeChoice &choice,
+// Looks up one task and mapper rectangle, recording hits and misses for the
+// scorer's audit footer. Repeated candidates reuse the same cached value.
+const TaskShapeCost *TaskShapeCostCache::get(const TaskShapeChoice &choice,
                                              std::string &error) {
-  // Counts the first request as a miss copied from the validated catalogue and
-  // serves every repeated task-shape request from the per-pass cache.
-  CostKey key{choice.task, choice.bodyId, choice.shape.mapperShapeId};
+  CostKey key{choice.task, choice.shape.mapperRows, choice.shape.mapperCols};
   auto cached = cache_.find(key);
   if (cached != cache_.end()) {
     ++hits_;
@@ -827,9 +721,9 @@ const BodyShapeCost *BodyShapeCostCache::get(const TaskShapeChoice &choice,
   }
   auto found = catalog_.find(key);
   if (found == catalog_.end()) {
-    error = "missing cost for task=" + choice.task +
-            ", body_id=" + choice.bodyId +
-            ", mapper_shape=" + choice.shape.mapperShapeId;
+    error =
+        "missing cost for task=" + choice.task + ", mapper_shape=" +
+        toMapperShapeString(choice.shape.mapperRows, choice.shape.mapperCols);
     return nullptr;
   }
   ++misses_;

@@ -168,20 +168,26 @@ SmallVector<CgraShape> getAllPlacementShapes(int cgra_count) {
   return shapes;
 }
 
-FailureOr<std::optional<int64_t>>
-computeTaskflowCounterTripCount(TaskflowTaskOp task, std::string &error) {
-  if (!task.getBody().hasOneBlock()) {
-    error =
-        "task " + task.getTaskName().str() + " must contain exactly one block";
-    return failure();
-  }
-
+// Infers a static trip count from Taskflow counter chains. A constant counter
+// such as `0..10 step 3` contributes four iterations; nested counters multiply
+// their counts, while independent root chains use the maximum chain product.
+// The result has three states: a number for static counters, nullopt when no
+// Taskflow counter exists, and failure for dynamic, malformed, or overflowing
+// counters. Dynamic bounds remain unsupported until symbolic trip-count
+// analysis is added.
+FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
+                                                           std::string &error) {
   SmallVector<TaskflowCounterOp> counters;
-  for (Operation &operation : task.getBody().front())
-    if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
-      counters.push_back(counter);
+  task.walk([&](TaskflowCounterOp counter) { counters.push_back(counter); });
   if (counters.empty())
     return std::optional<int64_t>{};
+  if (!task.getBody().hasOneBlock()) {
+    error = "task " + task.getTaskName().str() +
+            " has counters but does not contain exactly one block; static "
+            "analytical DSE does not support this form yet (TODO: support "
+            "symbolic counter regions)";
+    return failure();
+  }
 
   SmallVector<TaskflowCounterOp> roots;
   DenseMap<Value, SmallVector<TaskflowCounterOp>> children;
@@ -202,12 +208,15 @@ computeTaskflowCounterTripCount(TaskflowTaskOp task, std::string &error) {
       return constant.value();
     return failure();
   };
+  // TODO: Extends this analysis with symbolic bounds when analytical DSE gains
+  // a policy for comparing dynamic trip counts.
   auto counterTripCount = [&](TaskflowCounterOp counter) -> FailureOr<int64_t> {
     FailureOr<int64_t> lower = constantIndex(counter.getLowerBound());
     FailureOr<int64_t> upper = constantIndex(counter.getUpperBound());
     FailureOr<int64_t> step = constantIndex(counter.getStep());
-    if (failed(lower) || failed(upper) || failed(step) || *step <= 0 ||
-        *upper <= *lower ||
+    if (failed(lower) || failed(upper) || failed(step))
+      return failure();
+    if (*step <= 0 || *upper <= *lower ||
         (*lower < 0 && *upper > std::numeric_limits<int64_t>::max() + *lower))
       return failure();
     int64_t distance = *upper - *lower;
@@ -230,7 +239,9 @@ computeTaskflowCounterTripCount(TaskflowTaskOp task, std::string &error) {
       if (failed(count) ||
           chainProduct > std::numeric_limits<int64_t>::max() / *count) {
         error = "task " + task.getTaskName().str() +
-                " has dynamic, invalid, or overflowing counter bounds";
+                " has dynamic, invalid, or overflowing counter bounds; "
+                "static analytical DSE does not support this form yet "
+                "(TODO: support symbolic counter bounds)";
         return failure();
       }
       chainProduct *= *count;

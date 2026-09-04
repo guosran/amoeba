@@ -57,7 +57,7 @@ struct MaterializeAnalyticalTaskCandidatePass
       llvm::cl::init(-1)};
 
   void runOnOperation() override {
-    // Requires exactly one selector so a stable ID and a debugging index
+    // Requires exactly one selector so a sequential ID and a debugging index
     // cannot disagree about which candidate should be materialized.
     ModuleOp module = getOperation();
     std::string error;
@@ -82,15 +82,8 @@ struct MaterializeAnalyticalTaskCandidatePass
       func.emitError() << error;
       return signalPassFailure();
     }
-    FailureOr<std::string> architectureFingerprint =
-        currentArchitectureFingerprint(error);
-    if (failed(architectureFingerprint)) {
-      func.emitError() << error;
-      return signalPassFailure();
-    }
-
     // Continues through the footer after finding the requested record. This
-    // validates the digest and detects any second matching record.
+    // validates the complete v2 manifest and detects any second match.
     std::optional<Candidate> selected;
     ManifestHeader header;
     ManifestFooter footer;
@@ -107,8 +100,7 @@ struct MaterializeAnalyticalTaskCandidatePass
     };
     if (!readCandidateManifest(
             candidateFile.getValue(), *taskFacts, func.getSymName(),
-            ::mlir::neura::getArchitecture(), *architectureFingerprint, consume,
-            header, footer, error)) {
+            ::mlir::neura::getArchitecture(), consume, header, footer, error)) {
       if (error.empty())
         error = "candidate selection is ambiguous";
       func.emitError() << error;
@@ -120,15 +112,15 @@ struct MaterializeAnalyticalTaskCandidatePass
       return signalPassFailure();
     }
 
-    // Delays mutation until the manifest, digest, IR, architecture, and record
-    // have all been validated. These attributes configure the unchanged
-    // downstream heuristic mapper; this pass fabricates no placement or II.
+    // Delays mutation until the manifest, IR, architecture, and record have
+    // all been validated. These attributes configure the unchanged downstream
+    // heuristic mapper; this pass fabricates no placement or II.
     OpBuilder builder(func.getContext());
     for (auto [task, choice] : llvm::zip(*taskFacts, selected->choices)) {
       task.op->setAttr("cgra_count",
                        builder.getI32IntegerAttr(choice.shape.cgraCount()));
-      task.op->setAttr("cgra_shape",
-                       builder.getStringAttr(choice.shape.irAttr()));
+      task.op->setAttr("cgra_shape", builder.getStringAttr(
+                                         choice.shape.toCgraShapeAttrValue()));
     }
     func->setAttr("analytical_task_candidate_id",
                   builder.getStringAttr(selected->id));

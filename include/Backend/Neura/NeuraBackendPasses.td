@@ -67,9 +67,9 @@ def EnumerateAnalyticalTaskCandidates
   let summary = "Freeze the complete rectangular task-shape candidate space";
   let description = [{
     Enumerates every Cartesian product of rectangular per-task CGRA shapes in
-    the declared finite shape space and writes a checksummed JSONL manifest.
-    The manifest and candidate IDs are bound to the exact architecture-spec
-    content hash.
+    the declared finite shape space and writes a versioned JSONL manifest.
+    The manifest records the explicit grid and per-CGRA tile dimensions read
+    from architecture.yaml, and assigns sequential IDs such as candidate-0.
     This pass does not consult an analytical score, invoke Neura's mapper, or
     modify the IR.  The initial implementation fixes fusion, fission, tiling,
     placement, and temporal order to their identity choices; later search axes
@@ -100,11 +100,11 @@ def ScoreAnalyticalTaskCandidates
   let description = [{
     Validates and scores every candidate from a complete manifest using a
     versioned ML II/startup cost catalogue.  All repeated queries share one
-    (task, body ID, mapper shape, model namespace) cache.  Only after the
+    (task, mapper tile rows, mapper tile columns) cache.  Only after the
     complete manifest has been consumed is the top-k shortlist emitted.  The
     current shape-only score is explicitly a compute-bottleneck estimate, not
-    the final communication-aware pipeline interval.  The catalogue must carry
-    the same architecture fingerprint as the current compiler invocation.
+    the final communication-aware pipeline interval.  The catalogue uses
+    explicit mapper tile dimensions and version 2 of the cost schema.
   }];
   let options = [
     Option<"functionName", "function", "std::string", /*default=*/"\"\"",
@@ -129,7 +129,7 @@ def MaterializeAnalyticalTaskCandidate
     : Pass<"materialize-analytical-task-candidate", "ModuleOp"> {
   let summary = "Materialize one frozen analytical task candidate";
   let description = [{
-    Selects exactly one candidate by stable ID (or by manifest index for
+    Selects exactly one candidate by sequential ID (or by manifest index for
     testing) and writes its cgra_count/cgra_shape decisions to Taskflow tasks.
     It does not invoke the mapper.  An external driver may therefore run this
     pass followed by the unchanged heuristic mapper exactly once per top-k ID.
@@ -140,7 +140,7 @@ def MaterializeAnalyticalTaskCandidate
     Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
            "Path to the frozen candidate JSONL manifest.">,
     Option<"candidateId", "candidate-id", "std::string", /*default=*/"\"\"",
-           "Stable candidate ID to materialize.">,
+           "Sequential candidate ID to materialize.">,
     Option<"candidateIndex", "candidate-index", "int64_t", /*default=*/"-1",
            "Zero-based manifest index; intended for tests/debugging.">
   ];

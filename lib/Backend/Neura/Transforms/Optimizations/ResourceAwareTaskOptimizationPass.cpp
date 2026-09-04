@@ -663,7 +663,7 @@ private:
   static int64_t computeTripCount(TaskflowTaskOp task) {
     std::string error;
     FailureOr<std::optional<int64_t>> taskflowCount =
-        computeTaskflowCounterTripCount(task, error);
+        inferStaticTaskTripCount(task, error);
     if (failed(taskflowCount)) {
       llvm::errs() << "[computeTripCount] " << error << "\n";
       assert(false && "Expected static Taskflow counter bounds");

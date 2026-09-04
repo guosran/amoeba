@@ -8,11 +8,11 @@
 
 #include "Backend/Neura/NeuraBackendPasses.h"
 
+#include "NeuraDialect/Architecture/Architecture.h"
+
 #include "mlir/Pass/Pass.h"
 
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/JSON.h"
-#include "llvm/Support/SHA256.h"
 
 #include <cstdint>
 #include <functional>
@@ -78,8 +78,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
 
-    // Snapshots the semantic task facts and builds the single-task shape
-    // alphabet from the physical architecture.
+    // Collects static task facts and builds the single-task shape alphabet from
+    // the architecture values read by Neura's YAML loader.
     FailureOr<SmallVector<TaskFact>> taskFacts = collectTaskFacts(func, error);
     if (failed(taskFacts)) {
       func.emitError() << error;
@@ -87,13 +87,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
     }
     const ::mlir::neura::Architecture &architecture =
         ::mlir::neura::getArchitecture();
-    FailureOr<std::string> architectureFingerprint =
-        currentArchitectureFingerprint(error);
-    if (failed(architectureFingerprint)) {
-      func.emitError() << error;
-      return signalPassFailure();
-    }
-    SmallVector<RectShape> shapes = enumerateRectShapes(
+    SmallVector<RectShape> shapes = enumerateStaticRectShapes(
         architecture.getMultiCgraRows(), architecture.getMultiCgraColumns(),
         architecture.getPerCgraRows(), architecture.getPerCgraColumns(),
         maxCgrasPerTask.getValue());
@@ -133,13 +127,10 @@ struct EnumerateAnalyticalTaskCandidatesPass
               int64_t{architecture.getPerCgraRows()};
           architectureRecord["per_cgra_tile_cols"] =
               int64_t{architecture.getPerCgraColumns()};
-          architectureRecord["spec_fingerprint"] = *architectureFingerprint;
-
           llvm::json::Array tasks;
           for (const TaskFact &task : *taskFacts) {
             llvm::json::Object record;
             record["task"] = task.name;
-            record["body_id"] = task.bodyId;
             record["trip_count"] = task.tripCount;
             tasks.push_back(std::move(record));
           }
@@ -148,8 +139,6 @@ struct EnumerateAnalyticalTaskCandidatesPass
             for (const RectShape &shape : shapes) {
               llvm::json::Object query;
               query["task"] = task.name;
-              query["body_id"] = task.bodyId;
-              query["mapper_shape_id"] = shape.mapperShapeId;
               query["mapper_tile_rows"] = shape.mapperRows;
               query["mapper_tile_cols"] = shape.mapperCols;
               costQueries.push_back(std::move(query));
@@ -167,7 +156,6 @@ struct EnumerateAnalyticalTaskCandidatesPass
           header["schema_version"] = kCandidateSchema.str();
           header["search_scope"] = kSearchScope.str();
           header["shape_policy"] = kShapePolicy.str();
-          header["candidate_identity"] = kCandidateIdentity.str();
           header["function"] = function;
           header["architecture"] = std::move(architectureRecord);
           header["max_cgras_per_task"] = maxCgrasPerTask.getValue();
@@ -176,26 +164,22 @@ struct EnumerateAnalyticalTaskCandidatesPass
           header["fixed_axes"] = std::move(fixedAxes);
           writeJsonLine(os, std::move(header));
 
-          // Emits the Cartesian product in task-major mixed-radix order. This
-          // pass has no analytical score, so it retains every valid shape.
-          llvm::SHA256 idsDigest;
+          // Emits the complete Cartesian product in task-major mixed-radix
+          // order. This pass has no score, so it retains every valid shape.
           uint64_t emitted = 0;
           SmallVector<TaskShapeChoice> selected;
           std::function<void(size_t)> visit = [&](size_t taskIndex) {
             if (taskIndex == taskFacts->size()) {
               Candidate candidate;
               candidate.choices = selected;
-              candidate.id = makeCandidateId(function, *architectureFingerprint,
-                                             candidate.choices);
+              candidate.id = makeSequentialCandidateId(emitted);
               writeJsonLine(os, candidateJson(candidate));
-              updateCandidateIdDigest(idsDigest, candidate.id);
               ++emitted;
               return;
             }
             const TaskFact &task = (*taskFacts)[taskIndex];
             for (const RectShape &shape : shapes) {
-              selected.push_back(
-                  {task.name, task.bodyId, task.tripCount, shape});
+              selected.push_back({task.name, task.tripCount, shape});
               visit(taskIndex + 1);
               selected.pop_back();
             }
@@ -206,14 +190,12 @@ struct EnumerateAnalyticalTaskCandidatesPass
             return false;
           }
 
-          // Closes the stream with its record count and ordered-ID digest. The
-          // common reader recomputes both values before scoring or replay.
+          // Closes the stream with its record count. The common reader
+          // recomputes the expected product size and verifies every ID.
           llvm::json::Object footer;
           footer["record_type"] = "footer";
           footer["schema_version"] = kCandidateSchema.str();
           footer["candidate_count"] = static_cast<int64_t>(emitted);
-          footer["candidate_ids_sha256"] =
-              llvm::toHex(idsDigest.final(), /*LowerCase=*/true);
           writeJsonLine(os, std::move(footer));
           return true;
         },

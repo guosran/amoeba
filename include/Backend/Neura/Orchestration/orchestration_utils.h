@@ -79,11 +79,13 @@ getRectangularShapes(int cgra_count, int grid_rows = kCgraGridRows,
 //   2. Non-rectangular shapes (L, T, etc.) in all unique rotations.
 llvm::SmallVector<CgraShape> getAllPlacementShapes(int cgra_count);
 
-// Computes the static trip count represented by Taskflow counter chains.
-// Returns std::nullopt when the task has no Taskflow counters.  Fails for
-// malformed, dynamic, or overflowing counter chains and records the reason.
-FailureOr<std::optional<int64_t>>
-computeTaskflowCounterTripCount(TaskflowTaskOp task, std::string &error);
+// Infers a static trip count from Taskflow counter chains. Returns
+// success(number) when all counter bounds are constant, success(std::nullopt)
+// when the task has no Taskflow counter, and failure when a counter is dynamic,
+// malformed, or overflows. The failure path marks dynamic bounds as unsupported
+// for static analytical DSE; it never substitutes a guessed count.
+FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
+                                                           std::string &error);
 
 // Global placement feasibility.
 

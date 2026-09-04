@@ -22,8 +22,8 @@
 //
 // Preserves exhaustive DSE by keeping scores out of enumeration, refusing to
 // truncate oversized spaces, scoring every frozen record before sorting, and
-// validating the complete manifest before mutating IR. Uses SHA-256 only for
-// stable content identity and tamper/staleness detection, never as a score.
+// validating the complete manifest before mutating IR. This protocol version
+// supports only static rectangular shapes and static trip counts.
 //
 //===----------------------------------------------------------------------===//
 
@@ -41,7 +41,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
-#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
@@ -55,16 +54,14 @@ namespace neura {
 namespace analytical_dse {
 
 inline constexpr llvm::StringLiteral kCandidateSchema =
-    "amoeba-analytical-task-candidates-v1";
-inline constexpr llvm::StringLiteral kCostSchema = "amoeba-task-shape-cost-v1";
+    "amoeba-analytical-task-candidates-v2";
+inline constexpr llvm::StringLiteral kCostSchema = "amoeba-task-shape-cost-v2";
 inline constexpr llvm::StringLiteral kScoreSchema =
-    "amoeba-analytical-task-scores-v1";
-inline constexpr llvm::StringLiteral kShapePolicy = "rectangles-v1";
-inline constexpr llvm::StringLiteral kSearchScope = "shape-only-v1";
-inline constexpr llvm::StringLiteral kCandidateIdentity =
-    "shape-candidate-sha256-v1";
+    "amoeba-analytical-task-scores-v2";
+inline constexpr llvm::StringLiteral kShapePolicy = "static-rectangles-v2";
+inline constexpr llvm::StringLiteral kSearchScope = "static-shape-only-v2";
 inline constexpr llvm::StringLiteral kScoreModel =
-    "shape-only-compute-bottleneck-v1";
+    "static-shape-compute-bottleneck-v2";
 
 // Stores one physical-CGRA rectangle and its corresponding mapper dimensions.
 struct RectShape {
@@ -72,24 +69,21 @@ struct RectShape {
   int64_t cols = 1;
   int64_t mapperRows = 1;
   int64_t mapperCols = 1;
-  std::string mapperShapeId;
 
   int64_t cgraCount() const { return rows * cols; }
-  std::string irAttr() const;
+  std::string toCgraShapeAttrValue() const;
 };
 
 // Stores immutable facts extracted from one Taskflow task.
 struct TaskFact {
   taskflow::TaskflowTaskOp op;
   std::string name;
-  std::string bodyId;
   int64_t tripCount = 1;
 };
 
 // Stores one task's shape choice within a program candidate.
 struct TaskShapeChoice {
   std::string task;
-  std::string bodyId;
   int64_t tripCount = 1;
   RectShape shape;
 };
@@ -103,7 +97,6 @@ struct Candidate {
 // Stores the values that define a finite candidate space.
 struct ManifestHeader {
   std::string function;
-  std::string architectureFingerprint;
   int64_t gridRows = 0;
   int64_t gridCols = 0;
   int64_t perCgraRows = 0;
@@ -111,43 +104,38 @@ struct ManifestHeader {
   int64_t maxCgrasPerTask = 0;
 };
 
-// Stores the record count and ordered-ID digest that close a manifest.
+// Stores the record count that closes a manifest.
 struct ManifestFooter {
   uint64_t candidateCount = 0;
-  std::string candidateIdsSha256;
 };
 
-// Stores the ML prediction for one task-body and mapper-shape query.
-struct BodyShapeCost {
+// Stores the ML prediction for one task and mapper-shape query.
+struct TaskShapeCost {
   double predictedII = 0.0;
   double startupCycles = 0.0;
   bool supported = false;
 };
 
-using CostKey = std::tuple<std::string, std::string, std::string>;
+using CostKey = std::tuple<std::string, int64_t, int64_t>;
 
 // Stores the sortable score for one supported program candidate.
 struct RankedCandidate {
   std::string id;
+  uint64_t manifestIndex = 0;
   double score = 0.0;
 };
 
 using CandidateConsumer =
     llvm::function_ref<bool(uint64_t, const Candidate &, std::string &)>;
 
-// Computes a lowercase SHA-256 digest for stable content identity.
-std::string sha256Hex(llvm::StringRef text);
-// Adds one candidate ID and a record separator to the manifest digest.
-void updateCandidateIdDigest(llvm::SHA256 &hasher, llvm::StringRef candidateId);
-FailureOr<std::string> currentArchitectureFingerprint(std::string &error);
 FailureOr<llvm::SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
                                                         std::string &error);
-llvm::SmallVector<RectShape>
-enumerateRectShapes(int64_t gridRows, int64_t gridCols, int64_t perCgraRows,
-                    int64_t perCgraCols, int64_t maxCgrasPerTask);
-std::string makeCandidateId(llvm::StringRef function,
-                            llvm::StringRef architectureFingerprint,
-                            llvm::ArrayRef<TaskShapeChoice> choices);
+llvm::SmallVector<RectShape> enumerateStaticRectShapes(int64_t gridRows,
+                                                       int64_t gridCols,
+                                                       int64_t perCgraRows,
+                                                       int64_t perCgraCols,
+                                                       int64_t maxCgrasPerTask);
+std::string makeSequentialCandidateId(uint64_t index);
 llvm::json::Object candidateJson(const Candidate &candidate);
 void writeJsonLine(llvm::raw_ostream &os, llvm::json::Object object);
 bool writeAtomically(llvm::StringRef output,
@@ -160,30 +148,27 @@ FailureOr<func::FuncOp> selectTaskFunction(ModuleOp module,
 bool readCandidateManifest(llvm::StringRef path, llvm::ArrayRef<TaskFact> tasks,
                            llvm::StringRef expectedFunction,
                            const ::mlir::neura::Architecture &architecture,
-                           llvm::StringRef architectureFingerprint,
                            CandidateConsumer consume, ManifestHeader &header,
                            ManifestFooter &footer, std::string &error);
 
 // Adapts the scorer to the ML agent's task-shape cost catalogue. Memoizes each
-// (task, body ID, mapper shape) lookup across the full candidate traversal.
-class BodyShapeCostCache {
+// (task name, mapper tile rows, mapper tile columns) lookup across the full
+// candidate traversal.
+class TaskShapeCostCache {
 public:
   bool load(llvm::StringRef path, llvm::StringRef expectedFunction,
-            llvm::StringRef expectedArchitectureFingerprint,
             std::string &error);
-  const BodyShapeCost *get(const TaskShapeChoice &choice, std::string &error);
+  const TaskShapeCost *get(const TaskShapeChoice &choice, std::string &error);
 
   llvm::StringRef nameSpace() const { return namespace_; }
-  llvm::StringRef catalogSha256() const { return catalogSha256_; }
   uint64_t hits() const { return hits_; }
   uint64_t misses() const { return misses_; }
   uint64_t entries() const { return cache_.size(); }
 
 private:
   std::string namespace_;
-  std::string catalogSha256_;
-  std::map<CostKey, BodyShapeCost> catalog_;
-  std::map<CostKey, BodyShapeCost> cache_;
+  std::map<CostKey, TaskShapeCost> catalog_;
+  std::map<CostKey, TaskShapeCost> cache_;
   uint64_t hits_ = 0;
   uint64_t misses_ = 0;
 };

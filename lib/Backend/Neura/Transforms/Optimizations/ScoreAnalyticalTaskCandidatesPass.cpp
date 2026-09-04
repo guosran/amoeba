@@ -87,15 +87,8 @@ struct ScoreAnalyticalTaskCandidatesPass
       func.emitError() << error;
       return signalPassFailure();
     }
-    FailureOr<std::string> architectureFingerprint =
-        currentArchitectureFingerprint(error);
-    if (failed(architectureFingerprint)) {
-      func.emitError() << error;
-      return signalPassFailure();
-    }
-    BodyShapeCostCache costs;
-    if (!costs.load(costFile.getValue(), func.getSymName(),
-                    *architectureFingerprint, error)) {
+    TaskShapeCostCache costs;
+    if (!costs.load(costFile.getValue(), func.getSymName(), error)) {
       func.emitError() << error;
       return signalPassFailure();
     }
@@ -110,20 +103,19 @@ struct ScoreAnalyticalTaskCandidatesPass
     bool wrote = writeAtomically(
         outputFile.getValue(),
         [&](llvm::raw_ostream &os) {
-          // Binds the ranking to the candidate schema, architecture, model
-          // namespace, and exact bytes of the cost catalogue.
+          // Records the schema, model namespace, and score model that produced
+          // this ranking. The candidate reader separately validates the
+          // architecture dimensions and complete candidate space.
           llvm::json::Object scoreHeader;
           scoreHeader["record_type"] = "header";
           scoreHeader["schema_version"] = kScoreSchema.str();
           scoreHeader["candidate_schema_version"] = kCandidateSchema.str();
           scoreHeader["function"] = func.getSymName().str();
-          scoreHeader["architecture_fingerprint"] = *architectureFingerprint;
           scoreHeader["cost_namespace"] = costs.nameSpace().str();
-          scoreHeader["cost_catalog_sha256"] = costs.catalogSha256().str();
           scoreHeader["score_model"] = kScoreModel.str();
           writeJsonLine(os, std::move(scoreHeader));
 
-          auto consume = [&](uint64_t, const Candidate &candidate,
+          auto consume = [&](uint64_t manifestIndex, const Candidate &candidate,
                              std::string &consumeError) {
             // Computes one shape-only program score as follows.
             //
@@ -137,12 +129,13 @@ struct ScoreAnalyticalTaskCandidatesPass
             std::string rejectReason;
             llvm::json::Array taskCosts;
             for (const TaskShapeChoice &choice : candidate.choices) {
-              const BodyShapeCost *cost = costs.get(choice, consumeError);
+              const TaskShapeCost *cost = costs.get(choice, consumeError);
               if (!cost)
                 return false;
               llvm::json::Object taskCost;
               taskCost["task"] = choice.task;
-              taskCost["mapper_shape_id"] = choice.shape.mapperShapeId;
+              taskCost["mapper_tile_rows"] = choice.shape.mapperRows;
+              taskCost["mapper_tile_cols"] = choice.shape.mapperCols;
               taskCost["predicted_ii"] = cost->predictedII;
               taskCost["startup_cycles"] = cost->startupCycles;
               taskCost["trip_count"] = choice.tripCount;
@@ -158,7 +151,9 @@ struct ScoreAnalyticalTaskCandidatesPass
                 if (!std::isfinite(duration)) {
                   consumeError =
                       "task duration overflow for task=" + choice.task +
-                      ", mapper_shape=" + choice.shape.mapperShapeId;
+                      ", mapper_shape=rect-" +
+                      std::to_string(choice.shape.mapperRows) + "x" +
+                      std::to_string(choice.shape.mapperCols);
                   return false;
                 }
                 taskCost["support_status"] = "supported";
@@ -176,7 +171,7 @@ struct ScoreAnalyticalTaskCandidatesPass
             score["task_costs"] = std::move(taskCosts);
             if (valid) {
               score["predicted_compute_bottleneck"] = bottleneck;
-              ranked.push_back({candidate.id, bottleneck});
+              ranked.push_back({candidate.id, manifestIndex, bottleneck});
               ++validCount;
             } else {
               score["reject_reason"] = rejectReason;
@@ -188,10 +183,10 @@ struct ScoreAnalyticalTaskCandidatesPass
 
           // Invokes the consumer once per canonical record and rejects an
           // incomplete, reordered, or tampered candidate space.
-          if (!readCandidateManifest(
-                  candidateFile.getValue(), *taskFacts, func.getSymName(),
-                  ::mlir::neura::getArchitecture(), *architectureFingerprint,
-                  consume, manifestHeader, manifestFooter, error))
+          if (!readCandidateManifest(candidateFile.getValue(), *taskFacts,
+                                     func.getSymName(),
+                                     ::mlir::neura::getArchitecture(), consume,
+                                     manifestHeader, manifestFooter, error))
             return false;
           if (scoredCount != manifestFooter.candidateCount) {
             error = "not every frozen candidate was scored";
@@ -199,12 +194,14 @@ struct ScoreAnalyticalTaskCandidatesPass
           }
 
           // Sorts only after the proven manifest count has been scored. The
-          // candidate ID provides a deterministic tie breaker.
+          // numeric manifest index preserves enumeration order when scores tie;
+          // comparing strings would incorrectly place candidate-13 before
+          // candidate-5.
           llvm::sort(ranked, [](const RankedCandidate &lhs,
                                 const RankedCandidate &rhs) {
             if (lhs.score != rhs.score)
               return lhs.score < rhs.score;
-            return lhs.id < rhs.id;
+            return lhs.manifestIndex < rhs.manifestIndex;
           });
           uint64_t selected =
               topK.getValue() == 0
@@ -220,7 +217,7 @@ struct ScoreAnalyticalTaskCandidatesPass
           }
 
           // Directs the external driver to materialize only the shortlist. It
-          // also records enough counts and provenance to audit full scoring.
+          // also records enough counts to audit full scoring.
           llvm::json::Object cacheStats;
           cacheStats["hits"] = static_cast<int64_t>(costs.hits());
           cacheStats["misses"] = static_cast<int64_t>(costs.misses());
@@ -232,8 +229,6 @@ struct ScoreAnalyticalTaskCandidatesPass
               static_cast<int64_t>(manifestFooter.candidateCount);
           footer["scored_count"] = static_cast<int64_t>(scoredCount);
           footer["valid_count"] = static_cast<int64_t>(validCount);
-          footer["candidate_ids_sha256"] = manifestFooter.candidateIdsSha256;
-          footer["cost_catalog_sha256"] = costs.catalogSha256().str();
           footer["top_k_requested"] = topK.getValue();
           footer["shortlist"] = std::move(shortlist);
           footer["cache"] = std::move(cacheStats);
