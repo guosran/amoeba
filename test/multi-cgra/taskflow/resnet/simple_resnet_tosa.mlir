@@ -61,10 +61,12 @@
 // RUN: --leverage-predicated-value \
 // RUN: --transform-ctrl-to-data-flow \
 // RUN: --fold-constant \
-// RUN: '--resource-aware-task-optimization=balance-skip-mapper=false' \
+// RUN: '--resource-aware-task-optimization=disable-fusion=true estimation-mode=cost-model-analytical use-predicted-ii=true import-allocation=%S/no_fusion_allocation.json objective-mode=makespan' \
 // RUN: --architecture-spec=%S/../../../archspec/architecture_with_counter.yaml \
-// RUN: -o %t.resopt.mlir
-// RUN: FileCheck %s --input-file=%t.resopt.mlir --check-prefixes=RESOPT
+// RUN: -o %t.lowered.mlir
+// RUN: FileCheck %s --input-file=%t.lowered.mlir --check-prefixes=LOWERED \
+// RUN:   --implicit-check-not=_utilfused \
+// RUN:   --implicit-check-not='cgra_count = 2'
 
 module attributes {torch.debug_module_name = "SimpleResNetBlock"} {
   func.func @forward(%arg0: tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32> {
@@ -1305,6 +1307,33 @@ module attributes {torch.debug_module_name = "SimpleResNetBlock"} {
 // MAP-SPATIAL-TEMPORAL-1x2-NEXT:  }
 // MAP-SPATIAL-TEMPORAL-1x2-NEXT:}
 
+// Resource-aware profiling remains enabled, but task fusion is disabled and the
+// imported all-1x1 allocation prevents balance/fission from changing resources.
+// Memory-access streaming fusion still runs earlier, so its two fused names remain.
+// LOWERED-LABEL: func.func @forward
+// LOWERED:       taskflow.task @Task_0{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_1{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_2{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_3{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_4_Task_5_fused{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_6{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_7{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_8{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_9{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+// LOWERED:       taskflow.task @Task_10_Task_11_Task_12_fused_fused{{.*}}cgra_count = 1 : i32{{.*}}compiled_ii = 1 : i32
+// LOWERED:       neura.kernel
+
+// Disabled legacy fused output retained below as a reference for when the
+// fusion/fission policy is re-enabled.
 // RESOPT:          %done_reads, %done_writes:3 = taskflow.task @Task_1_Task_0_Task_2_utilfused_utilfused will_reads(%arg0 : memref<1x64x8x8xf32>) will_writes(%alloc_3, %alloc, %alloc_4 : memref<1x10x10x64xf32>, memref<1x8x8x64xf32>, memref<1x8x8x64xf32>) value_inputs(%cst_2 : f32) [original_read_memrefs(%arg0 : memref<1x64x8x8xf32>), original_write_memrefs(%alloc_3, %alloc, %alloc_4 : memref<1x10x10x64xf32>, memref<1x8x8x64xf32>, memref<1x8x8x64xf32>)] {cgra_count = 2 : i32, cgra_shape = "1x2", compiled_ii = 5 : i32, profile_info = {duration = 3 : i32}, trip_count = 6400 : i32} : (memref<1x64x8x8xf32>, memref<1x10x10x64xf32>, memref<1x8x8x64xf32>, memref<1x8x8x64xf32>, f32) -> (memref<1x64x8x8xf32>, memref<1x10x10x64xf32>, memref<1x8x8x64xf32>, memref<1x8x8x64xf32>) {
 // RESOPT-NEXT:     ^bb0(%arg1: memref<1x64x8x8xf32>, %arg2: memref<1x10x10x64xf32>, %arg3: memref<1x8x8x64xf32>, %arg4: memref<1x8x8x64xf32>, %arg5: f32):
 // RESOPT-NEXT:       %c64 = arith.constant 64 : index
