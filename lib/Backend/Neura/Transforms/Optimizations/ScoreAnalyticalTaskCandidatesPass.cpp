@@ -88,7 +88,8 @@ struct ScoreAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
     TaskShapeCostCache costs;
-    if (!costs.load(costFile.getValue(), func.getSymName(), error)) {
+    if (!costs.load(costFile.getValue(), func.getSymName(), *taskFacts,
+                    error)) {
       func.emitError() << error;
       return signalPassFailure();
     }
@@ -108,11 +109,15 @@ struct ScoreAnalyticalTaskCandidatesPass
           // architecture dimensions and complete candidate space.
           llvm::json::Object scoreHeader;
           scoreHeader["record_type"] = "header";
-          scoreHeader["schema_version"] = kScoreSchema.str();
-          scoreHeader["candidate_schema_version"] = kCandidateSchema.str();
+          scoreHeader["schema"] = kScoreSchema.str();
+          scoreHeader["candidate_schema"] = kCandidateSchema.str();
           scoreHeader["function"] = func.getSymName().str();
           scoreHeader["cost_namespace"] = costs.nameSpace().str();
+          scoreHeader["candidate_manifest_sha256"] =
+              costs.candidateManifestSha256().str();
+          scoreHeader["architecture_sha256"] = costs.architectureSha256().str();
           scoreHeader["score_model"] = kScoreModel.str();
+          scoreHeader["mapper_success_probability"] = "diagnostic_only";
           writeJsonLine(os, std::move(scoreHeader));
 
           auto consume = [&](uint64_t manifestIndex, const Candidate &candidate,
@@ -165,7 +170,7 @@ struct ScoreAnalyticalTaskCandidatesPass
 
             llvm::json::Object score;
             score["record_type"] = "score";
-            score["schema_version"] = kScoreSchema.str();
+            score["schema"] = kScoreSchema.str();
             score["candidate_id"] = candidate.id;
             score["valid"] = valid;
             score["task_costs"] = std::move(taskCosts);
@@ -183,13 +188,23 @@ struct ScoreAnalyticalTaskCandidatesPass
 
           // Invokes the consumer once per canonical record and rejects an
           // incomplete, reordered, or tampered candidate space.
-          if (!readCandidateManifest(candidateFile.getValue(), *taskFacts,
-                                     func.getSymName(),
-                                     ::mlir::neura::getArchitecture(), consume,
-                                     manifestHeader, manifestFooter, error))
+          if (!readCandidateManifest(
+                  candidateFile.getValue(), *taskFacts, func.getSymName(),
+                  ::mlir::neura::getArchitecture(),
+                  costs.candidateManifestSha256(), costs.architectureSha256(),
+                  consume, manifestHeader, manifestFooter, error))
             return false;
           if (scoredCount != manifestFooter.candidateCount) {
             error = "not every frozen candidate was scored";
+            return false;
+          }
+          // Enumeration declares only (task, shape) queries used by at least
+          // one concurrently packable candidate. Full traversal must therefore
+          // touch every catalogue entry. Equality rejects stale extras; a
+          // missing entry fails at lookup above.
+          if (costs.entries() != costs.catalogEntries()) {
+            error = "cost catalogue does not exactly cover candidate manifest "
+                    "task-shape queries";
             return false;
           }
 
@@ -224,7 +239,7 @@ struct ScoreAnalyticalTaskCandidatesPass
           cacheStats["entries"] = static_cast<int64_t>(costs.entries());
           llvm::json::Object footer;
           footer["record_type"] = "footer";
-          footer["schema_version"] = kScoreSchema.str();
+          footer["schema"] = kScoreSchema.str();
           footer["candidate_count"] =
               static_cast<int64_t>(manifestFooter.candidateCount);
           footer["scored_count"] = static_cast<int64_t>(scoredCount);

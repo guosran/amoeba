@@ -64,16 +64,21 @@ def OrchestrateTasksOnAccelerators
 
 def EnumerateAnalyticalTaskCandidates
     : Pass<"enumerate-analytical-task-candidates", "ModuleOp"> {
-  let summary = "Freeze the complete rectangular task-shape candidate space";
+  let summary = "Freeze all concurrently packable task-shape candidates";
   let description = [{
-    Enumerates every Cartesian product of rectangular per-task CGRA shapes in
-    the declared finite shape space and writes a versioned JSONL manifest.
-    The manifest records the explicit grid and per-CGRA tile dimensions read
-    from architecture.yaml, and assigns sequential IDs such as candidate-0.
-    This pass does not consult an analytical score, invoke Neura's mapper, or
-    modify the IR.  The initial implementation fixes fusion, fission, tiling,
-    placement, and temporal order to their identity choices; later search axes
-    extend the same manifest contract.
+    Enumerates every ordered assignment of fixed-orientation rectangular
+    per-task CGRA shapes that admits a simultaneous, non-overlapping placement
+    on the physical multi-CGRA grid, then writes an explicit JSONL manifest.
+    Exact placement feasibility is checked with a small backtracking search;
+    temporal reuse cannot make an over-capacity tuple legal.  The concrete
+    placement coordinates remain a downstream heuristic choice.  The manifest
+    records the explicit grid and per-CGRA tile dimensions read from
+    architecture.yaml and assigns contiguous IDs such as candidate-0.  This
+    pass does not consult an analytical score or invoke Neura's mapper. After
+    the complete manifest is published, it annotates each source task with the
+    canonical body hash that a task-DFG extractor must preserve. The initial
+    implementation fixes fusion, fission, tiling, concrete placement, and
+    temporal order; later search axes extend the same contract.
   }];
   let options = [
     Option<"functionName", "function", "std::string", /*default=*/"\"\"",
@@ -99,12 +104,12 @@ def ScoreAnalyticalTaskCandidates
   let summary = "Score every candidate in a frozen analytical-task manifest";
   let description = [{
     Validates and scores every candidate from a complete manifest using a
-    versioned ML II/startup cost catalogue.  All repeated queries share one
+    named ML II/startup cost catalogue.  All repeated queries share one
     (task, mapper tile rows, mapper tile columns) cache.  Only after the
     complete manifest has been consumed is the top-k shortlist emitted.  The
     current shape-only score is explicitly a compute-bottleneck estimate, not
     the final communication-aware pipeline interval.  The catalogue uses
-    explicit mapper tile dimensions and version 2 of the cost schema.
+    explicit mapper tile dimensions and a fixed cost schema.
   }];
   let options = [
     Option<"functionName", "function", "std::string", /*default=*/"\"\"",
@@ -112,7 +117,7 @@ def ScoreAnalyticalTaskCandidates
     Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
            "Path to the frozen candidate JSONL manifest.">,
     Option<"costFile", "cost-file", "std::string", /*default=*/"\"\"",
-           "Path to the versioned task-shape ML cost catalogue.">,
+           "Path to the task-shape ML cost catalogue.">,
     Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
            "Path to the score JSONL manifest.">,
     Option<"topK", "top-k", "int64_t", /*default=*/"1",

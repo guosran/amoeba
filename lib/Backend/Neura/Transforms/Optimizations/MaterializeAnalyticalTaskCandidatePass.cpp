@@ -83,7 +83,7 @@ struct MaterializeAnalyticalTaskCandidatePass
       return signalPassFailure();
     }
     // Continues through the footer after finding the requested record. This
-    // validates the complete v2 manifest and detects any second match.
+    // validates the complete manifest and detects any second match.
     std::optional<Candidate> selected;
     ManifestHeader header;
     ManifestFooter footer;
@@ -100,7 +100,9 @@ struct MaterializeAnalyticalTaskCandidatePass
     };
     if (!readCandidateManifest(
             candidateFile.getValue(), *taskFacts, func.getSymName(),
-            ::mlir::neura::getArchitecture(), consume, header, footer, error)) {
+            ::mlir::neura::getArchitecture(), /*expectedManifestSha256=*/{},
+            /*expectedArchitectureSha256=*/{}, consume, header, footer,
+            error)) {
       if (error.empty())
         error = "candidate selection is ambiguous";
       func.emitError() << error;
@@ -121,6 +123,11 @@ struct MaterializeAnalyticalTaskCandidatePass
                        builder.getI32IntegerAttr(choice.shape.cgraCount()));
       task.op->setAttr("cgra_shape", builder.getStringAttr(
                                          choice.shape.toCgraShapeAttrValue()));
+      // The ML model scored this orientation, not merely this rectangle's
+      // area. The scheduler may still choose the origin, but it must not turn a
+      // scored 1x4 shape into the separately scored 4x1 shape.
+      task.op->setAttr("amoeba.analytical_shape_orientation_fixed",
+                       builder.getUnitAttr());
     }
     func->setAttr("analytical_task_candidate_id",
                   builder.getStringAttr(selected->id));

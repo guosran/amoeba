@@ -14,15 +14,19 @@
 #include "mlir/IR/SymbolTable.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SHA256.h"
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -38,6 +42,41 @@ namespace amoeba {
 namespace neura {
 namespace analytical_dse {
 
+// Returns the lowercase SHA-256 used by the Python adapter. Hashes are taken
+// over raw file bytes so changes in comments or formatting conservatively
+// invalidate previously generated artifacts.
+static std::string sha256(StringRef bytes) {
+  llvm::SHA256 hasher;
+  hasher.update(bytes);
+  return llvm::toHex(hasher.final(), /*LowerCase=*/true);
+}
+
+static bool isSha256(StringRef value) {
+  return value.size() == 64 && llvm::all_of(value, [](char character) {
+           return (character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f');
+         });
+}
+
+// Fingerprints the exact YAML selected by --architecture-spec. Dimensions
+// alone are insufficient because two same-sized machines can have different
+// FU, memory, latency, or routing capabilities.
+FailureOr<std::string> currentArchitectureSha256(std::string &error) {
+  StringRef path = mlir::amoeba::getNeuraArchitectureSpecFile();
+  if (path.empty()) {
+    error = "analytical task DSE requires --architecture-spec";
+    return failure();
+  }
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      llvm::MemoryBuffer::getFile(path);
+  if (!buffer) {
+    error = "cannot fingerprint architecture specification " + path.str() +
+            ": " + buffer.getError().message();
+    return failure();
+  }
+  return sha256((*buffer)->getBuffer());
+}
+
 // Converts the physical CGRA rectangle into the string stored in the
 // Taskflow `cgra_shape` attribute, such as `1x2`.
 std::string RectShape::toCgraShapeAttrValue() const {
@@ -51,6 +90,8 @@ std::string RectShape::toCgraShapeAttrValue() const {
 // fails because treating it as one would produce an incorrect score.
 static FailureOr<int64_t> taskTripCount(TaskflowTaskOp task,
                                         std::string &error) {
+  // TODO: add an explicit runtime-parameter contract before admitting dynamic
+  // trip counts. The current static-shape protocol must fail rather than guess.
   if (auto attr = task->getAttrOfType<IntegerAttr>("trip_count")) {
     if (attr.getInt() <= 0) {
       error =
@@ -71,9 +112,35 @@ static FailureOr<int64_t> taskTripCount(TaskflowTaskOp task,
   return inferred->value_or(1);
 }
 
+// Produces a stable identity for the current task computation. We deliberately
+// remove DSE outputs and measurements so materializing a shape does not make
+// an otherwise identical task look new. A body edit, however, changes this
+// hash and invalidates the old candidate manifest before scoring.
+static std::string taskBodySha256(TaskflowTaskOp task) {
+  Operation *clone = task->clone();
+  auto destroyClone = llvm::make_scope_exit([&] { clone->destroy(); });
+  clone->setAttr("task_name",
+                 StringAttr::get(task.getContext(), "__analytical_task__"));
+  for (StringRef attribute :
+       {"trip_count", "cgra_count", "cgra_shape", "compiled_ii", "profile_info",
+        "task_orchestration_info", "replicas", "tiling", "est_latency"})
+    clone->removeAttr(attribute);
+  clone->removeAttr("amoeba.analytical_shape_orientation_fixed");
+  // This attribute is an exported copy of the hash being computed. Excluding
+  // it keeps the identity stable when an already-bound IR is enumerated again.
+  clone->removeAttr(kSourceTaskBodyShaAttr);
+  std::string printed;
+  llvm::raw_string_ostream stream(printed);
+  OpPrintingFlags flags;
+  flags.printGenericOpForm().useLocalScope();
+  clone->print(stream, flags);
+  stream.flush();
+  return sha256(printed);
+}
+
 // Collects task names, operations, and static trip counts in walk order. The
-// order is the task axis used by the candidate Cartesian product, so duplicate
-// names are rejected before they can make a cost lookup ambiguous.
+// order is the task axis used by shape-tuple enumeration, so duplicate names
+// are rejected before they can make a cost lookup ambiguous.
 FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
                                                   std::string &error) {
   SmallVector<TaskFact> tasks;
@@ -87,7 +154,7 @@ FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
     FailureOr<int64_t> tripCount = taskTripCount(task, error);
     if (failed(tripCount))
       return WalkResult::interrupt();
-    tasks.push_back({task, std::move(name), *tripCount});
+    tasks.push_back({task, std::move(name), taskBodySha256(task), *tripCount});
     return WalkResult::advance();
   });
   if (walkResult.wasInterrupted())
@@ -142,9 +209,158 @@ SmallVector<RectShape> enumerateStaticRectShapes(int64_t gridRows,
   return result;
 }
 
+// Tries to place the fixed-orientation rectangles exactly. This is a small
+// backtracking search over physical CGRA cells, not a solver and not the
+// downstream placement heuristic. Sorting large rectangles first only changes
+// search speed; it does not remove any legal placement.
+static bool placeRectangles(size_t rectangleIndex,
+                            ArrayRef<RectShape> rectangles, int64_t gridRows,
+                            int64_t gridCols,
+                            MutableArrayRef<uint8_t> occupied) {
+  if (rectangleIndex == rectangles.size())
+    return true;
+
+  const RectShape &shape = rectangles[rectangleIndex];
+  for (int64_t originRow = 0; originRow + shape.rows <= gridRows; ++originRow) {
+    for (int64_t originCol = 0; originCol + shape.cols <= gridCols;
+         ++originCol) {
+      bool overlaps = false;
+      for (int64_t row = 0; row < shape.rows && !overlaps; ++row) {
+        for (int64_t col = 0; col < shape.cols; ++col) {
+          size_t cell = static_cast<size_t>((originRow + row) * gridCols +
+                                            originCol + col);
+          if (occupied[cell]) {
+            overlaps = true;
+            break;
+          }
+        }
+      }
+      if (overlaps)
+        continue;
+
+      for (int64_t row = 0; row < shape.rows; ++row)
+        for (int64_t col = 0; col < shape.cols; ++col)
+          occupied[static_cast<size_t>((originRow + row) * gridCols +
+                                       originCol + col)] = 1;
+      if (placeRectangles(rectangleIndex + 1, rectangles, gridRows, gridCols,
+                          occupied))
+        return true;
+      for (int64_t row = 0; row < shape.rows; ++row)
+        for (int64_t col = 0; col < shape.cols; ++col)
+          occupied[static_cast<size_t>((originRow + row) * gridCols +
+                                       originCol + col)] = 0;
+    }
+  }
+  return false;
+}
+
+// Returns true only when all selected task rectangles can occupy the physical
+// grid at the same time. The area check is a cheap necessary condition. The
+// backtracking placement is still required because, for example, a horizontal
+// 1x4 rectangle and a vertical 4x1 rectangle have total area eight but cannot
+// coexist on a 4x4 grid: they must intersect in one cell.
+static bool canPackSimultaneously(ArrayRef<RectShape> selected,
+                                  int64_t gridRows, int64_t gridCols) {
+  if (gridRows <= 0 || gridCols <= 0 ||
+      gridRows > std::numeric_limits<int64_t>::max() / gridCols)
+    return false;
+  const int64_t gridArea = gridRows * gridCols;
+  int64_t selectedArea = 0;
+  SmallVector<RectShape> largestFirst(selected.begin(), selected.end());
+  for (const RectShape &shape : largestFirst) {
+    if (shape.rows <= 0 || shape.cols <= 0 || shape.rows > gridRows ||
+        shape.cols > gridCols || shape.rows > gridArea / shape.cols ||
+        selectedArea > gridArea - shape.cgraCount())
+      return false;
+    selectedArea += shape.cgraCount();
+  }
+  llvm::sort(largestFirst, [](const RectShape &lhs, const RectShape &rhs) {
+    if (lhs.cgraCount() != rhs.cgraCount())
+      return lhs.cgraCount() > rhs.cgraCount();
+    if (std::max(lhs.rows, lhs.cols) != std::max(rhs.rows, rhs.cols))
+      return std::max(lhs.rows, lhs.cols) > std::max(rhs.rows, rhs.cols);
+    return std::tie(lhs.rows, lhs.cols) > std::tie(rhs.rows, rhs.cols);
+  });
+
+  SmallVector<uint8_t> occupied(static_cast<size_t>(gridArea), 0);
+  return placeRectangles(0, largestFirst, gridRows, gridCols, occupied);
+}
+
+bool ConcurrentPackingCache::canPack(ArrayRef<RectShape> shapes) {
+  Key key;
+  key.reserve(shapes.size());
+  for (const RectShape &shape : shapes)
+    key.push_back({shape.rows, shape.cols});
+  llvm::sort(key, [](const auto &lhs, const auto &rhs) {
+    const int64_t lhsArea = lhs.first * lhs.second;
+    const int64_t rhsArea = rhs.first * rhs.second;
+    if (lhsArea != rhsArea)
+      return lhsArea > rhsArea;
+    if (std::max(lhs.first, lhs.second) != std::max(rhs.first, rhs.second))
+      return std::max(lhs.first, lhs.second) > std::max(rhs.first, rhs.second);
+    return lhs > rhs;
+  });
+
+  auto found = results_.find(key);
+  if (found != results_.end())
+    return found->second;
+  bool result = canPackSimultaneously(shapes, gridRows_, gridCols_);
+  results_.emplace(std::move(key), result);
+  return result;
+}
+
+bool visitConcurrentlyPackableShapeTuples(size_t taskCount,
+                                          ArrayRef<RectShape> shapes,
+                                          ConcurrentPackingCache &packing,
+                                          ShapeIndexTupleConsumer consume) {
+  const int64_t gridRows = packing.gridRows();
+  const int64_t gridCols = packing.gridCols();
+  if (taskCount == 0 || shapes.empty() || gridRows <= 0 || gridCols <= 0 ||
+      gridRows > std::numeric_limits<int64_t>::max() / gridCols)
+    return true;
+  const int64_t gridArea = gridRows * gridCols;
+  // Every supported task consumes at least one physical CGRA. This prevents a
+  // large task list from expanding an obviously empty Cartesian product.
+  if (taskCount > static_cast<size_t>(gridArea))
+    return true;
+
+  SmallVector<size_t> selectedIndices;
+  SmallVector<RectShape> selectedShapes;
+  uint64_t validIndex = 0;
+  std::function<bool(size_t, int64_t)> visit = [&](size_t taskIndex,
+                                                   int64_t selectedArea) {
+    if (taskIndex == taskCount) {
+      if (!packing.canPack(selectedShapes))
+        return true;
+      if (!consume(validIndex, selectedIndices))
+        return false;
+      ++validIndex;
+      return true;
+    }
+
+    // Shapes remain in their declared deterministic order. The area test
+    // removes only tuples that cannot possibly fit; geometry is checked
+    // exactly after one shape has been chosen for every task.
+    for (auto [shapeIndex, shape] : llvm::enumerate(shapes)) {
+      const int64_t area = shape.cgraCount();
+      if (area <= 0 || area > gridArea - selectedArea)
+        continue;
+      selectedIndices.push_back(shapeIndex);
+      selectedShapes.push_back(shape);
+      if (!visit(taskIndex + 1, selectedArea + area))
+        return false;
+      selectedShapes.pop_back();
+      selectedIndices.pop_back();
+    }
+    return true;
+  };
+  return visit(0, 0);
+}
+
 // Formats the deterministic candidate ID assigned by enumeration. For
 // example, the first candidate is `candidate-0`, and the next is
-// `candidate-1`; the numeric suffix is the canonical mixed-radix index.
+// `candidate-1`. The numeric suffix indexes only concurrently packable tuples,
+// so IDs stay contiguous after impossible shape assignments are removed.
 std::string makeSequentialCandidateId(uint64_t index) {
   return "candidate-" + std::to_string(index);
 }
@@ -166,7 +382,7 @@ static llvm::json::Object shapeJson(const RectShape &shape) {
 
 // Serializes one candidate while preserving task order. The candidate ID is a
 // sequential index, so no task-body identity or file-derived metadata is
-// required to interpret it within its validated v2 manifest.
+// required to interpret it within its validated manifest.
 llvm::json::Object candidateJson(const Candidate &candidate) {
   llvm::json::Array choices;
   for (const TaskShapeChoice &choice : candidate.choices) {
@@ -178,7 +394,7 @@ llvm::json::Object candidateJson(const Candidate &candidate) {
   }
   llvm::json::Object record;
   record["record_type"] = "candidate";
-  record["schema_version"] = kCandidateSchema.str();
+  record["schema"] = kCandidateSchema.str();
   record["candidate_id"] = candidate.id;
   record["task_shapes"] = std::move(choices);
   return record;
@@ -313,23 +529,25 @@ static std::optional<int64_t> checkedPositiveProduct(int64_t lhs, int64_t rhs) {
   return lhs * rhs;
 }
 
-// Parses the v2 manifest header, including the explicit architecture
+// Parses the manifest header, including the explicit architecture
 // dimensions that describe how physical CGRAs map to tiles. The dimensions
 // are later compared directly with `getArchitecture()` getters.
 static bool parseHeader(const llvm::json::Object &object,
                         ManifestHeader &header, std::string &error) {
-  std::optional<StringRef> schema =
-      requiredString(object, "schema_version", error);
+  std::optional<StringRef> schema = requiredString(object, "schema", error);
   std::optional<StringRef> function = requiredString(object, "function", error);
   std::optional<StringRef> scope =
       requiredString(object, "search_scope", error);
   std::optional<StringRef> policy =
       requiredString(object, "shape_policy", error);
+  std::optional<StringRef> capacityPolicy =
+      requiredString(object, "spatial_capacity_policy", error);
   const llvm::json::Object *architecture = object.getObject("architecture");
-  if (!schema || !function || !scope || !policy || !architecture)
+  if (!schema || !function || !scope || !policy || !capacityPolicy ||
+      !architecture)
     return false;
   if (*schema != kCandidateSchema || *scope != kSearchScope ||
-      *policy != kShapePolicy) {
+      *policy != kShapePolicy || *capacityPolicy != kSpatialCapacityPolicy) {
     error = "unsupported candidate manifest contract";
     return false;
   }
@@ -338,21 +556,29 @@ static bool parseHeader(const llvm::json::Object &object,
   auto gridCols = requiredInteger(*architecture, "grid_cols", error);
   auto perRows = requiredInteger(*architecture, "per_cgra_tile_rows", error);
   auto perCols = requiredInteger(*architecture, "per_cgra_tile_cols", error);
+  auto architectureSha = requiredString(*architecture, "spec_sha256", error);
   auto maxCgras = requiredInteger(object, "max_cgras_per_task", error);
-  if (!gridRows || !gridCols || !perRows || !perCols || !maxCgras)
+  if (!gridRows || !gridCols || !perRows || !perCols || !architectureSha ||
+      !maxCgras)
     return false;
-  header = {function->str(), *gridRows, *gridCols,
-            *perRows,        *perCols,  *maxCgras};
+  header = {function->str(), architectureSha->str(),
+            *gridRows,       *gridCols,
+            *perRows,        *perCols,
+            *maxCgras};
   if (header.gridRows <= 0 || header.gridCols <= 0 || header.perCgraRows <= 0 ||
       header.perCgraCols <= 0 || header.maxCgrasPerTask <= 0) {
     error = "candidate manifest dimensions must be positive";
     return false;
   }
+  if (!isSha256(header.architectureSha256)) {
+    error = "candidate manifest architecture SHA-256 is invalid";
+    return false;
+  }
   return true;
 }
 
-// Verifies that the manifest task list has the same names and static trip
-// counts as the current IR.
+// Verifies that the manifest task list has the same names, canonical bodies,
+// and static trip counts as the current IR.
 static bool validateHeaderTasks(const llvm::json::Object &object,
                                 ArrayRef<TaskFact> tasks, std::string &error) {
   const llvm::json::Array *records = object.getArray("tasks");
@@ -367,10 +593,13 @@ static bool validateHeaderTasks(const llvm::json::Object &object,
       return false;
     }
     auto name = requiredString(*record, "task", error);
+    auto bodySha = requiredString(*record, "body_sha256", error);
     auto tripCount = requiredInteger(*record, "trip_count", error);
-    if (!name || !tripCount)
+    if (!name || !bodySha || !tripCount)
       return false;
-    if (*name != tasks[index].name || *tripCount != tasks[index].tripCount) {
+    if (!isSha256(*bodySha) || *name != tasks[index].name ||
+        *bodySha != tasks[index].bodySha256 ||
+        *tripCount != tasks[index].tripCount) {
       error = "candidate manifest header task facts do not match current IR";
       return false;
     }
@@ -418,7 +647,7 @@ static bool sameShape(const RectShape &lhs, const RectShape &rhs) {
 static bool parseCandidate(const llvm::json::Object &object,
                            ArrayRef<TaskFact> tasks, Candidate &candidate,
                            std::string &error) {
-  auto schema = requiredString(object, "schema_version", error);
+  auto schema = requiredString(object, "schema", error);
   auto id = requiredString(object, "candidate_id", error);
   const llvm::json::Array *records = object.getArray("task_shapes");
   if (!schema || !id || !records)
@@ -454,61 +683,78 @@ static bool parseCandidate(const llvm::json::Object &object,
   return true;
 }
 
-// Computes the expected size of the task-shape Cartesian product.
-static FailureOr<uint64_t> expectedCandidateCount(size_t shapeCount,
-                                                  size_t taskCount,
-                                                  std::string &error) {
-  if (shapeCount == 0) {
-    error = "candidate manifest declares an empty shape space";
-    return failure();
-  }
-  uint64_t result = 1;
-  for (size_t ignored = 0; ignored < taskCount; ++ignored) {
-    if (result > std::numeric_limits<uint64_t>::max() / shapeCount) {
-      error = "declared candidate count overflows uint64";
-      return failure();
-    }
-    result *= shapeCount;
-  }
-  return result;
-}
-
-// Verifies the canonical mixed-radix shape assignment at one candidate index.
-// The last task changes fastest, so index 1 for two tasks means
-// `(task0=shape0, task1=shape1)`.
-static bool validateCandidateAtIndex(uint64_t index, ArrayRef<TaskFact> tasks,
-                                     ArrayRef<RectShape> shapes,
-                                     const Candidate &candidate,
-                                     std::string &error) {
+// Verifies one record from the filtered candidate stream. IDs are contiguous
+// among packable tuples. Shape tuples themselves must remain in the
+// lexicographic order produced by visitConcurrentlyPackableShapeTuples; this
+// rejects duplicates and reordering without storing the entire manifest.
+static bool validateCandidateAtIndex(
+    uint64_t index, ArrayRef<TaskFact> tasks, ArrayRef<RectShape> shapes,
+    ConcurrentPackingCache &packing, const Candidate &candidate,
+    SmallVectorImpl<size_t> &previousShapeIndices, std::string &error) {
   if (candidate.id != makeSequentialCandidateId(index)) {
     error = "candidate ID does not match its canonical manifest index";
     return false;
   }
-  SmallVector<size_t> shapeIndices(tasks.size());
-  uint64_t remainder = index;
-  for (size_t reverse = tasks.size(); reverse > 0; --reverse) {
-    shapeIndices[reverse - 1] = remainder % shapes.size();
-    remainder /= shapes.size();
-  }
-  if (remainder != 0 || candidate.choices.size() != tasks.size()) {
-    error = "candidate manifest contains more records than its declared space";
+  if (candidate.choices.size() != tasks.size()) {
+    error = "candidate task count does not match its declared space";
     return false;
   }
+  SmallVector<size_t> shapeIndices;
+  SmallVector<RectShape> selectedShapes;
   for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
-    if (!sameShape(candidate.choices[taskIndex].shape,
-                   shapes[shapeIndices[taskIndex]])) {
-      error = "candidate manifest is incomplete, duplicated, or out of order";
+    const RectShape &candidateShape = candidate.choices[taskIndex].shape;
+    auto found = llvm::find_if(shapes, [&](const RectShape &legalShape) {
+      return sameShape(candidateShape, legalShape);
+    });
+    if (found == shapes.end()) {
+      error = "candidate contains a shape outside its declared shape space";
       return false;
     }
+    shapeIndices.push_back(static_cast<size_t>(found - shapes.begin()));
+    selectedShapes.push_back(candidateShape);
   }
+  if (!packing.canPack(selectedShapes)) {
+    error = "candidate task rectangles cannot fit simultaneously on the "
+            "physical CGRA grid";
+    return false;
+  }
+  if (!previousShapeIndices.empty() &&
+      !std::lexicographical_compare(previousShapeIndices.begin(),
+                                    previousShapeIndices.end(),
+                                    shapeIndices.begin(), shapeIndices.end())) {
+    error = "candidate manifest is duplicated or out of canonical order";
+    return false;
+  }
+  previousShapeIndices.assign(shapeIndices.begin(), shapeIndices.end());
   return true;
 }
 
-// Compares manifest architecture dimensions directly with the current
-// architecture object. Reading architecture.yaml uses these getters; no file
-// fingerprint or other file-derived metadata is needed for this protocol.
+// Counts the exact concurrently packable space, but stops as soon as it proves
+// that the manifest's declared count is too small. Combined with strictly
+// increasing legal records, equal counts prove that no valid tuple is missing.
+static bool hasExactPackableCandidateCount(uint64_t declaredCount,
+                                           size_t taskCount,
+                                           ArrayRef<RectShape> shapes,
+                                           ConcurrentPackingCache &packing) {
+  uint64_t computedCount = 0;
+  bool exceededDeclaredCount = false;
+  bool completed = visitConcurrentlyPackableShapeTuples(
+      taskCount, shapes, packing, [&](uint64_t index, ArrayRef<size_t>) {
+        if (index >= declaredCount) {
+          exceededDeclaredCount = true;
+          return false;
+        }
+        computedCount = index + 1;
+        return true;
+      });
+  return completed && !exceededDeclaredCount && computedCount == declaredCount;
+}
+
+// Compares both architecture dimensions and the exact YAML bytes. The hash
+// catches capability or latency changes that dimensions alone cannot see.
 static bool architectureMatches(const ManifestHeader &header,
                                 const ::mlir::neura::Architecture &architecture,
+                                StringRef expectedArchitectureSha256,
                                 std::string &error) {
   if (header.gridRows != architecture.getMultiCgraRows() ||
       header.gridCols != architecture.getMultiCgraColumns() ||
@@ -518,16 +764,32 @@ static bool architectureMatches(const ManifestHeader &header,
             "Neura architecture";
     return false;
   }
+  FailureOr<std::string> currentSha = currentArchitectureSha256(error);
+  if (failed(currentSha))
+    return false;
+  if (header.architectureSha256 != *currentSha) {
+    error = "candidate manifest architecture SHA-256 does not match current "
+            "--architecture-spec";
+    return false;
+  }
+  if (!expectedArchitectureSha256.empty() &&
+      header.architectureSha256 != expectedArchitectureSha256) {
+    error = "cost catalogue architecture SHA-256 does not match candidate "
+            "manifest";
+    return false;
+  }
   return true;
 }
 
 // Streams and validates a complete candidate manifest before forwarding each
-// candidate to the scoring or materialization callback. The footer verifies
-// both the emitted count and the mathematically expected Cartesian-product
-// size; every candidate verifies its sequential ID and mixed-radix shape.
+// candidate to the scoring or materialization callback. Every record must be a
+// legal, concurrently packable shape tuple in canonical order. The footer is
+// then checked against an independent traversal of the exact packable space.
 bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
                            StringRef expectedFunction,
                            const ::mlir::neura::Architecture &architecture,
+                           StringRef expectedManifestSha256,
+                           StringRef expectedArchitectureSha256,
                            CandidateConsumer consume, ManifestHeader &header,
                            ManifestFooter &footer, std::string &error) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -537,12 +799,20 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
             buffer.getError().message();
     return false;
   }
+  const std::string manifestSha = sha256((*buffer)->getBuffer());
+  if (!expectedManifestSha256.empty() &&
+      manifestSha != expectedManifestSha256) {
+    error = "cost catalogue candidate manifest SHA-256 does not match the "
+            "candidate file";
+    return false;
+  }
 
   bool sawHeader = false;
   bool sawFooter = false;
   uint64_t count = 0;
-  uint64_t declaredSpaceCount = 0;
   SmallVector<RectShape> legalShapes;
+  SmallVector<size_t> previousShapeIndices;
+  std::unique_ptr<ConcurrentPackingCache> packing;
   for (llvm::line_iterator lines(**buffer, /*SkipBlanks=*/true);
        !lines.is_at_end(); ++lines) {
     llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(*lines);
@@ -572,16 +842,18 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
         error = "candidate manifest function does not match current IR";
         return false;
       }
-      if (!architectureMatches(header, architecture, error))
+      if (!architectureMatches(header, architecture, expectedArchitectureSha256,
+                               error))
         return false;
       legalShapes = enumerateStaticRectShapes(
           header.gridRows, header.gridCols, header.perCgraRows,
           header.perCgraCols, header.maxCgrasPerTask);
-      FailureOr<uint64_t> computed =
-          expectedCandidateCount(legalShapes.size(), tasks.size(), error);
-      if (failed(computed))
+      if (legalShapes.empty()) {
+        error = "candidate manifest declares an empty shape space";
         return false;
-      declaredSpaceCount = *computed;
+      }
+      packing = std::make_unique<ConcurrentPackingCache>(header.gridRows,
+                                                         header.gridCols);
       sawHeader = true;
       continue;
     }
@@ -591,27 +863,28 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
         return false;
       }
       Candidate candidate;
-      if (!parseCandidate(*object, tasks, candidate, error) ||
-          !validateCandidateAtIndex(count, tasks, legalShapes, candidate,
-                                    error) ||
+      if (!parseCandidate(*object, tasks, candidate, error) || !packing ||
+          !validateCandidateAtIndex(count, tasks, legalShapes, *packing,
+                                    candidate, previousShapeIndices, error) ||
           !consume(count, candidate, error))
         return false;
       ++count;
       continue;
     }
     if (*recordType == "footer") {
-      auto schema = requiredString(*object, "schema_version", error);
+      auto schema = requiredString(*object, "schema", error);
       auto expectedCount = requiredInteger(*object, "candidate_count", error);
       if (!sawHeader || sawFooter || !schema || !expectedCount ||
-          *schema != kCandidateSchema || *expectedCount < 0) {
+          *schema != kCandidateSchema || *expectedCount <= 0) {
         if (error.empty())
           error = "invalid candidate manifest footer";
         return false;
       }
-      if (static_cast<uint64_t>(*expectedCount) != count ||
-          count != declaredSpaceCount) {
-        error = "candidate manifest count does not match its declared shape "
-                "space";
+      if (static_cast<uint64_t>(*expectedCount) != count || !packing ||
+          !hasExactPackableCandidateCount(count, tasks.size(), legalShapes,
+                                          *packing)) {
+        error = "candidate manifest count does not match the complete "
+                "concurrently packable shape space";
         return false;
       }
       footer = {count};
@@ -628,10 +901,11 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskFact> tasks,
   return true;
 }
 
-// Loads and validates the v2 task-shape cost catalogue. Each entry is keyed by
+// Loads and validates the task-shape cost catalogue. Each entry is keyed by
 // task name and explicit mapper tile dimensions, so a `rect-4x8` label remains
 // readable without becoming a correctness dependency.
 bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
+                              ArrayRef<TaskFact> expectedTasks,
                               std::string &error) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
@@ -652,11 +926,12 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     error = "cost catalogue must be a JSON object";
     return false;
   }
-  auto schema = requiredString(*root, "schema_version", error);
+  auto schema = requiredString(*root, "schema", error);
   auto function = requiredString(*root, "function", error);
   auto modelNamespace = requiredString(*root, "namespace", error);
+  llvm::json::Object *metadata = root->getObject("predictor_metadata");
   llvm::json::Array *entries = root->getArray("entries");
-  if (!schema || !function || !modelNamespace || !entries)
+  if (!schema || !function || !modelNamespace || !metadata || !entries)
     return false;
   if (*schema != kCostSchema || *function != expectedFunction ||
       modelNamespace->empty()) {
@@ -664,7 +939,80 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     return false;
   }
 
+  // Bind the predictions to the exact frozen candidate bytes and analytical
+  // inputs. A same-named task or same-sized architecture is not sufficient.
+  auto candidateSha =
+      requiredString(*metadata, "candidate_manifest_sha256", error);
+  llvm::json::Object *provenance = metadata->getObject("analytical_provenance");
+  llvm::json::Object *architectureContract =
+      metadata->getObject("architecture_contract");
+  llvm::json::Object *rankingPolicy = metadata->getObject("ranking_policy");
+  if (!candidateSha || !provenance || !architectureContract || !rankingPolicy)
+    return false;
+  auto architectureSha =
+      requiredString(*provenance, "architecture_sha256", error);
+  llvm::json::Object *taskBodyHashes =
+      provenance->getObject("task_body_sha256");
+  llvm::json::Object *taskHashes = provenance->getObject("task_dfg_sha256");
+  auto successRole =
+      requiredString(*rankingPolicy, "mapper_success_probability", error);
+  std::optional<bool> usesSuccess =
+      rankingPolicy->getBoolean("uses_mapper_success_probability");
+  if (!architectureSha || !taskBodyHashes || !taskHashes || !successRole ||
+      !usesSuccess)
+    return false;
+  if (!isSha256(*candidateSha) || !isSha256(*architectureSha)) {
+    error = "cost catalogue provenance contains an invalid SHA-256";
+    return false;
+  }
+  auto architectureContractId =
+      requiredString(*architectureContract, "contract_id", error);
+  llvm::json::Array *supportedArchitectures =
+      architectureContract->getArray("supported_architecture_sha256");
+  if (!architectureContractId || architectureContractId->empty() ||
+      !supportedArchitectures || supportedArchitectures->empty())
+    return false;
+  bool architectureIsSupported = false;
+  for (const llvm::json::Value &value : *supportedArchitectures) {
+    std::optional<StringRef> supportedSha = value.getAsString();
+    if (!supportedSha || !isSha256(*supportedSha)) {
+      error = "cost catalogue architecture contract contains an invalid "
+              "SHA-256";
+      return false;
+    }
+    architectureIsSupported |= *supportedSha == *architectureSha;
+  }
+  if (!architectureIsSupported) {
+    error = "cost catalogue analytical architecture is outside the model's "
+            "supported architecture contract";
+    return false;
+  }
+  if (*successRole != "diagnostic_only" || *usesSuccess) {
+    error = "cost catalogue must keep mapper success probability "
+            "diagnostic-only";
+    return false;
+  }
+
+  if (taskBodyHashes->size() != expectedTasks.size() ||
+      taskHashes->size() != expectedTasks.size()) {
+    error = "cost catalogue task provenance does not exactly cover current IR "
+            "tasks";
+    return false;
+  }
+  for (const TaskFact &task : expectedTasks) {
+    std::optional<StringRef> bodySha = taskBodyHashes->getString(task.name);
+    std::optional<StringRef> dfgSha = taskHashes->getString(task.name);
+    if (!bodySha || !dfgSha || !isSha256(*dfgSha) ||
+        *bodySha != task.bodySha256) {
+      error = "cost catalogue task provenance does not bind the current task "
+              "body to its source DFG";
+      return false;
+    }
+  }
+
   namespace_ = modelNamespace->str();
+  candidateManifestSha256_ = candidateSha->str();
+  architectureSha256_ = architectureSha->str();
   catalog_.clear();
   cache_.clear();
   hits_ = 0;
@@ -689,10 +1037,14 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     if (*status == "supported") {
       auto ii = entry->getNumber("predicted_ii");
       auto startup = entry->getNumber("startup_cycles");
-      if (!ii || !startup || !std::isfinite(*ii) || !std::isfinite(*startup) ||
-          *ii <= 0.0 || *startup <= 0.0) {
+      auto lowerBound = entry->getNumber("analytical_lower_bound");
+      if (!ii || !startup || !lowerBound || !std::isfinite(*ii) ||
+          !std::isfinite(*startup) || !std::isfinite(*lowerBound) ||
+          *ii <= 0.0 || *startup <= 0.0 || *lowerBound <= 0.0 ||
+          *ii < *lowerBound) {
         error = "supported cost requires positive finite predicted_ii and "
-                "startup_cycles";
+                "startup_cycles and analytical_lower_bound, and "
+                "predicted_ii >= analytical_lower_bound";
         return false;
       }
       cost = {*ii, *startup, true};
