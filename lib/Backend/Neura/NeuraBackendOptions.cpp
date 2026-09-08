@@ -4,6 +4,10 @@
 
 #include "llvm/Support/CommandLine.h"
 
+// Keep the option storage separate from NeuraBackend.cpp. Optimization passes
+// need these values, while the backend itself links the optimization library;
+// defining the options in the backend would introduce a circular library
+// dependency.
 namespace {
 
 llvm::cl::opt<std::string> neuraArchitectureSpec(

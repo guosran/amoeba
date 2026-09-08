@@ -4,17 +4,21 @@
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
 #include <climits>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -30,7 +34,7 @@ namespace taskflow {
 // CgraShape member implementations
 
 std::string CgraShape::describe(int cgra_count) const {
-  std::string s = std::to_string(rows) + "x" + std::to_string(cols);
+  std::string s = formatRectangularCgraShape(rows, cols);
   if (!is_rectangular) {
     s += "(non-rect, " + std::to_string(cgra_count) + " CGRAs:";
     for (auto &[c, r] : cgra_positions)
@@ -40,8 +44,12 @@ std::string CgraShape::describe(int cgra_count) const {
   return s;
 }
 
+std::string formatRectangularCgraShape(int64_t rows, int64_t cols) {
+  return std::to_string(rows) + "x" + std::to_string(cols);
+}
+
 std::string CgraShape::irAttr() const {
-  std::string s = std::to_string(rows) + "x" + std::to_string(cols);
+  std::string s = formatRectangularCgraShape(rows, cols);
   if (!is_rectangular && !cgra_positions.empty()) {
     s += "[";
     for (auto &[c, r] : cgra_positions)
@@ -171,10 +179,10 @@ SmallVector<CgraShape> getAllPlacementShapes(int cgra_count) {
 // Infers a static trip count from Taskflow counter chains. A constant counter
 // such as `0..10 step 3` contributes four iterations; nested counters multiply
 // their counts, while independent root chains use the maximum chain product.
-// The result has three states: a number for static counters, nullopt when no
-// Taskflow counter exists, and failure for dynamic, malformed, or overflowing
-// counters. Dynamic bounds remain unsupported until symbolic trip-count
-// analysis is added.
+// The result has three states: a number for static counters, `std::nullopt`
+// when no Taskflow counter exists, and failure for dynamic, malformed, or
+// overflowing counters. Supporting dynamic bounds requires symbolic trip-count
+// analysis.
 FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
                                                            std::string &error) {
   SmallVector<TaskflowCounterOp> counters;
@@ -257,6 +265,47 @@ FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
     return failure();
   }
   return std::optional<int64_t>{total};
+}
+
+FailureOr<std::optional<int64_t>>
+resolveStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
+  if (auto tripCount = task->getAttrOfType<IntegerAttr>("trip_count")) {
+    if (tripCount.getInt() <= 0) {
+      error =
+          "task " + task.getTaskName().str() + " has non-positive trip_count";
+      return failure();
+    }
+    return std::optional<int64_t>{tripCount.getInt()};
+  }
+  return inferStaticTaskTripCount(task, error);
+}
+
+SmallVector<TaskflowTaskOp> collectTaskflowTasks(func::FuncOp func) {
+  SmallVector<TaskflowTaskOp> tasks;
+  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+  return tasks;
+}
+
+void setTaskResourceShape(TaskflowTaskOp task, int cgraCount,
+                          StringRef cgraShape) {
+  OpBuilder builder(task.getContext());
+  task->setAttr("cgra_count", builder.getI32IntegerAttr(cgraCount));
+  task->setAttr("cgra_shape", builder.getStringAttr(cgraShape));
+}
+
+int64_t encodeCgraLocation(int row, int col) {
+  return (static_cast<int64_t>(row) << 32) | static_cast<uint32_t>(col);
+}
+
+int getTaskTileGroup(TaskflowTaskOp task) {
+  if (auto group = task->getAttrOfType<IntegerAttr>("tile_group"))
+    return static_cast<int>(group.getInt());
+  return -1;
+}
+
+bool isParallelTaskTile(TaskflowTaskOp task) {
+  auto parallel = task->getAttrOfType<BoolAttr>("tile_parallel");
+  return !parallel || parallel.getValue();
 }
 
 // canAllTasksFitOnGrid
@@ -365,9 +414,10 @@ bool canAllTasksFitOnGrid(ArrayRef<int> task_cgra_counts) {
 struct CgraPosition {
   int row;
   int col;
-  int start_time = 0; // Internal scheduling; not emitted to IR.
-  int duration = 1;   // Read from profile_info; not emitted to IR.
-  int context_id = 0; // Emitted to IR as task_orchestration_info.
+  // Cycle counts of whole kernels, so 64-bit: see TaskScheduleResult.
+  int64_t start_time = 0; // Internal scheduling; not emitted to IR.
+  int64_t duration = 1;   // Read from profile_info; not emitted to IR.
+  int context_id = 0;     // Emitted to IR as task_orchestration_info.
 
   bool operator==(const CgraPosition &other) const {
     return row == other.row && col == other.col;
@@ -440,15 +490,36 @@ struct TaskNode {
 
   // Returns the task's execution duration in time slots.
   //
-  // Reads from profile_info.duration if present (written by
-  // ResourceAwareTaskOptimizationPass after profiling).
-  // Defaults to 1 when no profiling data is available.
-  int getDuration() const {
+  // Prefers `est_latency` = II*(trip_count-1) + steps, written by
+  // ResourceAwareTaskOptimizationPass. A task holds its CGRA for its whole
+  // execution, not just its pipeline depth, so `profile_info.duration` (the DFG
+  // depth) understates residency by the entire iteration count — and, being
+  // independent of trip_count, it makes every decision that changes the
+  // iteration space (loop partitioning, replication) invisible to this
+  // scheduler. Falls back to the depth, then to 1, when latency is absent.
+  int64_t getDuration() const {
+    if (auto est_latency_attr = op->getAttrOfType<IntegerAttr>("est_latency")) {
+      int64_t est_latency_cycles = est_latency_attr.getInt();
+      if (est_latency_cycles > 0)
+        return est_latency_cycles;
+    }
     if (auto profile = op->getAttrOfType<DictionaryAttr>("profile_info")) {
       if (auto dur = dyn_cast_or_null<IntegerAttr>(profile.get("duration"))) {
-        return std::max(1, static_cast<int>(dur.getInt()));
+        return std::max<int64_t>(1, dur.getInt());
       }
     }
+    return 1;
+  }
+
+  // Replicas the grid could actually accommodate (<= getReplicas()).
+  int replicas_placed = 1;
+
+  // Number of data-parallel replicas of this task. Each replica is a separate
+  // tile array running the SAME configuration on a disjoint data partition, so
+  // they must all be resident at the same time.
+  int getReplicas() const {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("replicas"))
+      return std::max(1, static_cast<int>(attr.getInt()));
     return 1;
   }
 };
@@ -477,11 +548,11 @@ public:
   void build(func::FuncOp func) {
     // Phase 1: Creates a TaskNode for every TaskflowTaskOp in the function.
     size_t task_id = 0;
-    func.walk([&](TaskflowTaskOp task) {
+    for (TaskflowTaskOp task : collectTaskflowTasks(func)) {
       auto node = std::make_unique<TaskNode>(task_id++, task);
       op_to_node[task] = node.get();
       task_nodes.push_back(std::move(node));
-    });
+    }
 
     // Phase 2: Creates MemoryNodes using ORIGINAL memrefs (canonical identity).
     // Uses original_read_memrefs / original_write_memrefs so that aliased
@@ -548,6 +619,183 @@ private:
   }
 };
 
+// TaskPipelineIntervalAnalyzer
+
+TaskPipelineIntervalAnalyzer::TaskPipelineIntervalAnalyzer(
+    ArrayRef<TaskScheduleResult> schedule_result)
+    : schedule_result_(schedule_result) {}
+
+TaskPipelineIntervalResult TaskPipelineIntervalAnalyzer::analyze() {
+  TaskPipelineIntervalResult result;
+  if (schedule_result_.empty()) {
+    return result;
+  }
+
+  buildTaskIndex();
+  task_graph_.resize(schedule_result_.size());
+  buildDataDependenceEdges();
+  buildCgraExecutionOrderEdgesAndPipelineCycles();
+  return computeLongestPipelineCycle();
+}
+
+int64_t TaskPipelineIntervalAnalyzer::getTaskDuration(int task_idx) const {
+  return std::max<int64_t>(1, schedule_result_[task_idx].duration);
+}
+
+void TaskPipelineIntervalAnalyzer::addExecutionOrderEdge(int task_idx,
+                                                         int next_task_idx) {
+  if (task_idx < 0 || next_task_idx < 0 || task_idx == next_task_idx) {
+    return;
+  }
+  task_graph_[task_idx].push_back({next_task_idx, getTaskDuration(task_idx)});
+}
+
+void TaskPipelineIntervalAnalyzer::buildTaskIndex() {
+  for (auto [idx, task_result] : llvm::enumerate(schedule_result_)) {
+    TaskflowTaskOp task = task_result.task;
+    task_to_index_[task.getOperation()] = static_cast<int>(idx);
+  }
+}
+
+void TaskPipelineIntervalAnalyzer::buildDataDependenceEdges() {
+  for (auto [task_idx, task_result] : llvm::enumerate(schedule_result_)) {
+    for (TaskflowTaskOp pred : task_result.predecessor_tasks) {
+      auto pred_it = task_to_index_.find(pred.getOperation());
+      if (pred_it == task_to_index_.end()) {
+        continue;
+      }
+      addExecutionOrderEdge(pred_it->second, static_cast<int>(task_idx));
+    }
+  }
+}
+
+void TaskPipelineIntervalAnalyzer::
+    buildCgraExecutionOrderEdgesAndPipelineCycles() {
+  DenseMap<int64_t, SmallVector<int>> cgra_location_to_tasks;
+  for (auto [idx, task_result] : llvm::enumerate(schedule_result_)) {
+    for (const TaskScheduleResult::CgraOccupancy &occupancy :
+         task_result.cgra_occupancies) {
+      cgra_location_to_tasks[taskflow::encodeCgraLocation(occupancy.row,
+                                                          occupancy.col)]
+          .push_back(static_cast<int>(idx));
+    }
+  }
+
+  for (auto &entry : cgra_location_to_tasks) {
+    SmallVector<int> &tasks = entry.second;
+    llvm::sort(tasks, [&](int lhs, int rhs) {
+      const TaskScheduleResult &lhs_result = schedule_result_[lhs];
+      const TaskScheduleResult &rhs_result = schedule_result_[rhs];
+      if (lhs_result.start_time != rhs_result.start_time) {
+        return lhs_result.start_time < rhs_result.start_time;
+      }
+      return lhs < rhs;
+    });
+
+    for (size_t i = 1; i < tasks.size(); ++i) {
+      addExecutionOrderEdge(tasks[i - 1], tasks[i]);
+    }
+
+    int first_task_idx = tasks.front();
+    int last_task_idx = tasks.back();
+    cgra_pipeline_cycles_.push_back(
+        {last_task_idx, first_task_idx, getTaskDuration(last_task_idx)});
+  }
+}
+
+TaskPipelineIntervalAnalyzer::LongestExecutionPath
+TaskPipelineIntervalAnalyzer::findLongestPathToTarget(
+    int current_task_idx, int target_task_idx, DenseSet<int> &visiting,
+    DenseMap<int, LongestExecutionPath> &memo) const {
+  if (current_task_idx == target_task_idx) {
+    LongestExecutionPath result;
+    result.found = true;
+    result.path.push_back(current_task_idx);
+    return result;
+  }
+
+  if (visiting.contains(current_task_idx)) {
+    return LongestExecutionPath();
+  }
+
+  // Memoised on `current` for a fixed `target`. The plain recursion re-walks
+  // every path through every diamond, which is exponential in the graph: once
+  // the resource pass partitions a program into ~100 tasks with fan-out, this
+  // analysis stops terminating (axpy_20 ran past 400s where placement itself
+  // took 0.07s). `computeStartTimes` has already rejected any cycle by the time
+  // this runs, so on a DAG the memo is exact, not an approximation.
+  auto memo_it = memo.find(current_task_idx);
+  if (memo_it != memo.end()) {
+    return memo_it->second;
+  }
+
+  visiting.insert(current_task_idx);
+  LongestExecutionPath best;
+  for (const ExecutionOrderEdge &edge : task_graph_[current_task_idx]) {
+    LongestExecutionPath suffix = findLongestPathToTarget(
+        edge.next_task_idx, target_task_idx, visiting, memo);
+    if (!suffix.found) {
+      continue;
+    }
+
+    // int64_t, not int: `edge.latency` and `suffix.total_latency` are both
+    // int64_t because a GPT-2 prefill block measures 1.85e9 cycles on one task.
+    // Two such hops sum past INT32_MAX and wrap negative, at which point the
+    // comparison below picks the SHORTER branch and the interval this analysis
+    // publishes is a fraction of the truth.
+    int64_t total_latency = edge.latency + suffix.total_latency;
+    if (!best.found || total_latency > best.total_latency) {
+      best.found = true;
+      best.total_latency = total_latency;
+      best.path.clear();
+      best.path.push_back(current_task_idx);
+      best.path.append(suffix.path.begin(), suffix.path.end());
+    }
+  }
+  visiting.erase(current_task_idx);
+  memo[current_task_idx] = best;
+  return best;
+}
+
+TaskPipelineIntervalResult
+TaskPipelineIntervalAnalyzer::computeLongestPipelineCycle() const {
+  TaskPipelineIntervalResult result;
+  for (const CgraPipelineCycle &pipeline_cycle : cgra_pipeline_cycles_) {
+    DenseSet<int> visiting;
+    // One memo per target: the value cached is "longest path from `current` to
+    // THIS cycle's last task", so it cannot be shared across cycles.
+    DenseMap<int, LongestExecutionPath> memo;
+    LongestExecutionPath path =
+        findLongestPathToTarget(pipeline_cycle.first_task_idx,
+                                pipeline_cycle.last_task_idx, visiting, memo);
+    if (!path.found) {
+      continue;
+    }
+
+    int64_t interval = path.total_latency + pipeline_cycle.latency;
+    if (interval <= result.pipeline_interval) {
+      continue;
+    }
+
+    result.pipeline_interval = interval;
+    result.critical_path.clear();
+
+    int bottleneck_idx = pipeline_cycle.last_task_idx;
+    int64_t bottleneck_duration = getTaskDuration(bottleneck_idx);
+    for (int idx : path.path) {
+      const TaskScheduleResult &task_result = schedule_result_[idx];
+      result.critical_path.push_back(task_result.task);
+      int64_t duration = getTaskDuration(idx);
+      if (duration > bottleneck_duration) {
+        bottleneck_idx = idx;
+        bottleneck_duration = duration;
+      }
+    }
+    result.bottleneck_task = schedule_result_[bottleneck_idx].task;
+  }
+  return result;
+}
+
 // TaskScheduler
 // Orchestrates a task-memory graph onto a 2D multi-CGRA grid using the
 // priority provided by the caller.
@@ -561,8 +809,10 @@ private:
 // In SpatialTemporal mode, ASAP scheduling is applied via
 // computeEarliestStartTime() so that each task starts as soon as all explicit
 // taskflow dependencies have completed.
-TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode)
-    : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode) {
+TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode,
+                             bool comm_aware)
+    : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
+      comm_aware_(comm_aware) {
   cgra_occupancy_.resize(grid_rows_);
   for (auto &row : cgra_occupancy_) {
     row.resize(grid_cols_);
@@ -572,8 +822,9 @@ TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode)
 // Schedules all tasks and performs iterative SRAM assignment for `func`.
 bool TaskScheduler::schedule(func::FuncOp func,
                              const TaskPriorityMap &priority) {
-  SmallVector<TaskflowTaskOp> tasks;
-  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+  schedule_result_.clear();
+
+  SmallVector<TaskflowTaskOp> tasks = collectTaskflowTasks(func);
 
   if (tasks.empty()) {
     llvm::errs() << "No tasks to place.\n";
@@ -633,7 +884,14 @@ bool TaskScheduler::schedule(func::FuncOp func,
         cgra_count = attr.getInt();
       }
 
-      TaskPlacement placement = findBestPlacement(task_node, cgra_count, graph);
+      // Data-parallel replicas are ONE item, not `replicas` of them: they run
+      // the same configuration on disjoint partitions of the same iteration
+      // space at the same instant. `findBestPlacement` places the set together
+      // and reports how much of it the grid took.
+      int replicas = task_node->getReplicas();
+      int replicas_placed = 0;
+      TaskPlacement placement = findBestPlacement(task_node, cgra_count, graph,
+                                                  replicas, &replicas_placed);
 
       assert(!placement.cgra_positions.empty() &&
              "findBestPlacement must succeed: cgra_count should be "
@@ -642,12 +900,22 @@ bool TaskScheduler::schedule(func::FuncOp func,
 
       for (const auto &pos : placement.cgra_positions) {
         task_node->placement.push_back(pos);
-      }
-
-      for (const auto &pos : placement.cgra_positions) {
         if (posInBounds(pos)) {
           markOccupied(pos.row, pos.col, pos.start_time, pos.duration);
         }
+      }
+      task_node->replicas_placed = replicas_placed;
+      if (replicas_placed < replicas) {
+        // `est_latency` divides the iteration space by the replica count the
+        // allocator asked for. Placing fewer replicas than that leaves the
+        // attribute promising work no hardware performs, and every downstream
+        // consumer -- the interval analysis included -- reads the attribute.
+        // Correcting it here would contradict the allocation the IR records,
+        // so say it loudly instead of measuring a schedule that cannot run.
+        task_node->op->emitWarning()
+            << "placed " << replicas_placed << " of " << replicas
+            << " replicas; est_latency still assumes " << replicas
+            << ", so the reported interval understates this task";
       }
     }
 
@@ -662,7 +930,7 @@ bool TaskScheduler::schedule(func::FuncOp func,
   // For every physical CGRA (row, col), sort all tasks assigned to it by
   // their internal start_time, then assign context_id = 0, 1, 2, ...
   // This maps directly to the hardware context-memory index.
-  using TaskInterval = std::pair<int, TaskNode *>; // (start_time, node)
+  using TaskInterval = std::pair<int64_t, TaskNode *>; // (start_time, node)
   std::vector<std::vector<SmallVector<TaskInterval, 4>>> cell_tasks(
       grid_rows_, std::vector<SmallVector<TaskInterval, 4>>(grid_cols_));
 
@@ -675,23 +943,26 @@ bool TaskScheduler::schedule(func::FuncOp func,
     }
   }
 
-  for (int r = 0; r < grid_rows_; ++r) {
-    for (int c = 0; c < grid_cols_; ++c) {
-      auto &tasks_at_cell = cell_tasks[r][c];
+  for (int row = 0; row < grid_rows_; ++row) {
+    for (int col = 0; col < grid_cols_; ++col) {
+      auto &tasks_at_cell = cell_tasks[row][col];
       std::stable_sort(tasks_at_cell.begin(), tasks_at_cell.end(),
-                       [](const TaskInterval &a, const TaskInterval &b) {
-                         return a.first < b.first;
+                       [](const TaskInterval &lhs, const TaskInterval &rhs) {
+                         return lhs.first < rhs.first;
                        });
-      for (int ctx = 0; ctx < static_cast<int>(tasks_at_cell.size()); ++ctx) {
-        TaskNode *tn = tasks_at_cell[ctx].second;
-        for (CgraPosition &pos : tn->placement) {
-          if (pos.row == r && pos.col == c) {
-            pos.context_id = ctx;
+      for (int context_id = 0;
+           context_id < static_cast<int>(tasks_at_cell.size()); ++context_id) {
+        TaskNode *task_at_context = tasks_at_cell[context_id].second;
+        for (CgraPosition &pos : task_at_context->placement) {
+          if (pos.row == row && pos.col == col) {
+            pos.context_id = context_id;
           }
         }
       }
     }
   }
+
+  recordScheduleResult(graph);
 
   // Write output attributes.
   OpBuilder builder(func.getContext());
@@ -769,9 +1040,19 @@ bool TaskScheduler::schedule(func::FuncOp func,
     // downstream passes can read the task duration without re-computing it.
     if (!task_node->op->hasAttr("profile_info")) {
       SmallVector<NamedAttribute, 1> profile_attrs;
+      // i32 because the in-tree expectations pin that type. The scheduler
+      // itself carries 64-bit cycles; only this published copy is clamped, and
+      // it is a fallback that whole-kernel durations do not reach in practice
+      // (a task with an `est_latency` never takes this path).
+      const int64_t duration_cycles = task_node->getDuration();
+      if (duration_cycles > INT32_MAX)
+        task_node->op->emitWarning()
+            << "profile_info.duration " << duration_cycles
+            << " exceeds i32 and is clamped";
       profile_attrs.push_back(
           NamedAttribute(StringAttr::get(func.getContext(), "duration"),
-                         builder.getI32IntegerAttr(task_node->getDuration())));
+                         builder.getI32IntegerAttr(static_cast<int32_t>(
+                             std::min<int64_t>(duration_cycles, INT32_MAX)))));
       task_node->op->setAttr(
           "profile_info",
           DictionaryAttr::get(func.getContext(), profile_attrs));
@@ -780,8 +1061,85 @@ bool TaskScheduler::schedule(func::FuncOp func,
     // Removes upstream resource-binding attributes that have been consumed.
     task_node->op->removeAttr("cgra_count");
     task_node->op->removeAttr("cgra_shape");
+    task_node->op->removeAttr("amoeba.analytical_shape_orientation_fixed");
+  }
+
+  // Reports the schedule this pass actually produced. start_time and duration
+  // stay out of the IR (the attribute contract is the placement), but without
+  // them there is no way to read back what the spatial-temporal scheduler did,
+  // so they are printed: makespan, peak concurrent CGRAs, context depth, and
+  // the per-task interval.
+  {
+    int64_t makespan = 0;
+    int peak_contexts = 0;
+    int64_t busy_area = 0;
+    llvm::errs() << "\n=== Orchestrated Schedule ("
+                 << (mode_ == SchedulingMode::Spatial ? "spatial"
+                                                      : "spatial-temporal")
+                 << ", " << grid_rows_ << "x" << grid_cols_ << " CGRAs) ===\n";
+    for (auto &task_node : graph.task_nodes) {
+      if (task_node->placement.empty())
+        continue;
+      int64_t start = INT64_MAX, finish = 0;
+      int max_context_id = 0;
+      for (const CgraPosition &pos : task_node->placement) {
+        start = std::min(start, pos.start_time);
+        finish = std::max(finish, pos.start_time + pos.duration);
+        max_context_id = std::max(max_context_id, pos.context_id);
+      }
+      makespan = std::max(makespan, finish);
+      peak_contexts = std::max(peak_contexts, max_context_id + 1);
+      busy_area += (int64_t)(finish - start) * task_node->placement.size();
+      llvm::errs() << "  " << task_node->op.getTaskName() << ": start=" << start
+                   << " finish=" << finish
+                   << " cgras=" << task_node->placement.size()
+                   << " replicas=" << task_node->replicas_placed << "/"
+                   << task_node->getReplicas()
+                   << " max_context=" << max_context_id << "\n";
+    }
+    int64_t grid_area = (int64_t)grid_rows_ * grid_cols_;
+    double util = (makespan > 0 && grid_area > 0)
+                      ? (double)busy_area / ((double)makespan * grid_area)
+                      : 0.0;
+    llvm::errs() << "[Orchestrate] makespan=" << makespan
+                 << " tasks=" << graph.task_nodes.size()
+                 << " max_contexts_per_cgra=" << peak_contexts
+                 << " grid_utilisation=" << llvm::format("%.3f", util) << "\n";
   }
   return true;
+}
+
+void TaskScheduler::recordScheduleResult(const TaskMemoryGraph &graph) {
+  schedule_result_.clear();
+  for (const auto &task_node : graph.task_nodes) {
+    if (task_node->placement.empty()) {
+      continue;
+    }
+
+    TaskScheduleResult task_result;
+    task_result.task = task_node->op;
+    task_result.start_time = task_node->placement.front().start_time;
+    task_result.duration = task_node->placement.front().duration;
+    task_result.end_time = task_result.start_time + task_result.duration;
+
+    for (const CgraPosition &pos : task_node->placement) {
+      task_result.start_time = std::min(task_result.start_time, pos.start_time);
+      task_result.end_time =
+          std::max(task_result.end_time, pos.start_time + pos.duration);
+      task_result.cgra_occupancies.push_back(
+          {pos.row, pos.col, pos.start_time, pos.duration, pos.context_id});
+    }
+    task_result.duration = task_result.end_time - task_result.start_time;
+
+    for (TaskNode *pred : task_node->ssa_operands) {
+      task_result.predecessor_tasks.push_back(pred->op);
+    }
+    for (TaskNode *succ : task_node->ssa_users) {
+      task_result.successor_tasks.push_back(succ->op);
+    }
+
+    schedule_result_.push_back(std::move(task_result));
+  }
 }
 
 bool TaskScheduler::posInBounds(const CgraPosition &pos) const {
@@ -794,8 +1152,8 @@ bool TaskScheduler::posInBounds(const CgraPosition &pos) const {
 //
 // Spatial mode: occupied once any task is assigned (permanently taken).
 // SpatialTemporal mode: occupied if any existing interval overlaps.
-bool TaskScheduler::isOccupied(int row, int col, int start_time,
-                               int duration) const {
+bool TaskScheduler::isOccupied(int row, int col, int64_t start_time,
+                               int64_t duration) const {
   if (mode_ == SchedulingMode::Spatial) {
     return !cgra_occupancy_[row][col].empty();
   }
@@ -807,8 +1165,8 @@ bool TaskScheduler::isOccupied(int row, int col, int start_time,
   return false;
 }
 
-void TaskScheduler::markOccupied(int row, int col, int start_time,
-                                 int duration) {
+void TaskScheduler::markOccupied(int row, int col, int64_t start_time,
+                                 int64_t duration) {
   cgra_occupancy_[row][col].push_back({start_time, start_time + duration});
 }
 
@@ -825,18 +1183,85 @@ void TaskScheduler::resetTaskPlacements(TaskMemoryGraph &graph) {
 
 // Computes the earliest feasible start time for `task_node` such that all
 // explicit taskflow dependencies have completed.
-int TaskScheduler::computeEarliestStartTime(const TaskNode *task_node) const {
-  int min_time = 0;
+int64_t
+TaskScheduler::computeEarliestStartTime(const TaskNode *task_node) const {
+  int64_t min_time = 0;
 
-  auto updateFromPlacement = [&](const TaskNode *other) {
-    if (other != task_node && !other->placement.empty()) {
-      const CgraPosition &pos = other->placement[0];
-      min_time = std::max(min_time, pos.start_time + pos.duration);
+  // Tiles cut from the same loop by the resource-aware pass carry a shared
+  // tile_group. They are threaded through the memref dependence-state SSA
+  // because that value chain is linear, but the dimension they partition is
+  // dependence-free (that is the precondition the cut was made under), so the
+  // chain is an ordering artefact. Honouring it here would serialise every tile
+  // and cancel the partitioning outright.
+  const int task_tile_group = getTaskTileGroup(task_node->op);
+
+  auto updateFromPlacement = [&](const TaskNode *producer) {
+    if (producer == task_node || producer->placement.empty())
+      return;
+    // Only a parallel-safe group may ignore its own chain; an ordered group
+    // (a reduction cut into pieces) must keep it.
+    if (task_tile_group >= 0 &&
+        getTaskTileGroup(producer->op) == task_tile_group &&
+        isParallelTaskTile(task_node->op))
+      return;
+    const CgraPosition &pos = producer->placement[0];
+    min_time = std::max(min_time, pos.start_time + pos.duration);
+    // TaskTiler rewires consumers onto the LAST tile of a group, so depending
+    // on that one tile is not the same as depending on the group. Wait for
+    // every sibling of the producer too, or tiles 0..n-2 -- which have no other
+    // path here once their chain is dropped -- could still be running.
+    const int producer_tile_group = getTaskTileGroup(producer->op);
+    if (producer_tile_group >= 0 && producer_tile_group != task_tile_group) {
+      // The siblings are reachable by walking the SSA chain backwards: tile i
+      // consumes tile i-1, so the last tile transitively names them all.
+      const TaskNode *cur_tile = producer;
+      for (int guard = 0; guard < 4096 && cur_tile; ++guard) {
+        const TaskNode *prev_tile = nullptr;
+        for (const TaskNode *operand_task : cur_tile->ssa_operands)
+          if (getTaskTileGroup(operand_task->op) == producer_tile_group) {
+            prev_tile = operand_task;
+            break;
+          }
+        if (!prev_tile || prev_tile->placement.empty())
+          break;
+        const CgraPosition &prev_tile_position = prev_tile->placement[0];
+        min_time = std::max(min_time, prev_tile_position.start_time +
+                                          prev_tile_position.duration);
+        cur_tile = prev_tile;
+      }
     }
   };
 
   for (const TaskNode *pred : task_node->ssa_operands) {
     updateFromPlacement(pred);
+  }
+  // A tile inherits its group's external predecessors: without this a tile
+  // whose only SSA operand is its sibling would float to time 0.
+  //
+  // The inheritance has to reach the whole chain, not just the immediate
+  // sibling. TaskTiler seeds every tile from the ORIGINAL task's operands and
+  // then rewires only the memref dependence-state operand onto the previous
+  // tile, so a producer outside the group stays an operand of the HEAD tile
+  // alone. From tile i the head is i hops back, and every tile in between
+  // names nothing but a skipped sibling, so a single hop finds no external
+  // producer at all and tiles 2..n-1 start at time 0 -- ahead of the producer
+  // they read from. Bounded like the sibling walk above: a malformed chain
+  // must not hang the compiler.
+  if (task_tile_group >= 0) {
+    const TaskNode *cur_tile = task_node;
+    for (int guard = 0; guard < 4096 && cur_tile; ++guard) {
+      const TaskNode *prev_tile = nullptr;
+      for (const TaskNode *pred : cur_tile->ssa_operands)
+        if (getTaskTileGroup(pred->op) == task_tile_group) {
+          prev_tile = pred;
+          break;
+        }
+      if (!prev_tile)
+        break;
+      for (const TaskNode *group_external_pred : prev_tile->ssa_operands)
+        updateFromPlacement(group_external_pred);
+      cur_tile = prev_tile;
+    }
   }
   return min_time;
 }
@@ -877,46 +1302,108 @@ bool TaskScheduler::assignAllSrams(TaskMemoryGraph &graph) {
   return changed;
 }
 
+// Rectangles that hold `replicas` copies of `base`.
+//
+// A replicated task is one rigid item, not `replicas` independent ones: every
+// copy runs the same configuration on a disjoint data partition at the same
+// instant, so the set is resident together or not at all. Giving the set a
+// SHAPE is what lets the existing origin scan place it that way -- `a` copies
+// down by `b` across, for every factorisation a*b = replicas, in both
+// orientations of the tile array.
+SmallVector<CgraShape> TaskScheduler::replicaSetShapes(const CgraShape &base,
+                                                       int replicas) {
+  SmallVector<CgraShape> composites;
+  if (!base.is_rectangular || replicas <= 1)
+    return composites;
+
+  llvm::DenseSet<int64_t> seen_keys;
+  for (const CgraShape &orientation : rotationsOf(base)) {
+    for (int down = 1; down <= replicas; ++down) {
+      if (replicas % down != 0)
+        continue;
+      int rows = orientation.rows * down;
+      int cols = orientation.cols * (replicas / down);
+      if (rows > grid_rows_ || cols > grid_cols_)
+        continue;
+      int64_t key = ((int64_t)rows << 16) | cols;
+      if (seen_keys.insert(key).second)
+        composites.push_back({rows, cols, /*is_rectangular=*/true, {}});
+    }
+  }
+
+  // Most-square first, matching `getAllPlacementShapes`. A square set leaves
+  // square holes, and the holes are what the next task has to fit into.
+  llvm::sort(composites, [](const CgraShape &lhs, const CgraShape &rhs) {
+    int squareness_lhs = std::abs(lhs.rows - lhs.cols);
+    int squareness_rhs = std::abs(rhs.rows - rhs.cols);
+    if (squareness_lhs != squareness_rhs)
+      return squareness_lhs < squareness_rhs;
+    return lhs.area() < rhs.area();
+  });
+  return composites;
+}
+
 // Finds the best placement for `task_node` on the 2D multi-CGRA grid.
 //
-// In SpatialTemporal mode an outer time loop applies ASAP scheduling:
-// the earliest feasible start time is computed from dependency constraints,
-// then incremented by task_duration until a valid grid position is found.
+// In SpatialTemporal mode the search walks candidate start times: the earliest
+// one allowed by dependencies, then each instant a cell frees up.
 TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
                                                int cgra_count,
-                                               TaskMemoryGraph &graph) {
+                                               TaskMemoryGraph &graph,
+                                               int replicas,
+                                               int *replicas_placed) {
+  replicas = std::max(1, replicas);
+  if (replicas_placed)
+    *replicas_placed = 0;
+
   SmallVector<CgraShape> shapes_to_try;
   if (auto attr = task_node->op->getAttrOfType<StringAttr>("cgra_shape")) {
     StringRef cgra_shape_str = attr.getValue();
     if (!cgra_shape_str.empty()) {
       CgraShape base = parseCgraShapeToBase(cgra_shape_str, cgra_count);
-      shapes_to_try = rotationsOf(base);
+      if (task_node->op->hasAttr("amoeba.analytical_shape_orientation_fixed")) {
+        // Analytical DSE scores 1xN and Nx1 as different mapper shapes. Keep
+        // that selected direction while retaining the normal origin heuristic.
+        shapes_to_try.push_back(base);
+      } else {
+        shapes_to_try = rotationsOf(base);
+      }
     }
   }
   if (shapes_to_try.empty()) {
     shapes_to_try = getAllPlacementShapes(cgra_count);
   }
 
-  int task_duration = task_node->getDuration();
+  // Rectangles holding the whole replica set, tried before the individual
+  // arrays. A set placed as one rectangle leaves rectangular holes, and the
+  // holes are what the next task has to fit into.
+  SmallVector<CgraShape> set_shapes;
+  if (replicas > 1) {
+    llvm::DenseSet<int64_t> seen_keys;
+    for (const CgraShape &base : shapes_to_try) {
+      for (const CgraShape &composite : replicaSetShapes(base, replicas)) {
+        int64_t key = ((int64_t)composite.rows << 16) | composite.cols;
+        if (seen_keys.insert(key).second)
+          set_shapes.push_back(composite);
+      }
+    }
+  }
 
-  int t_start = (mode_ == SchedulingMode::SpatialTemporal)
-                    ? computeEarliestStartTime(task_node)
-                    : 0;
-  // Time horizon: at minimum every task gets one sequential slot per cell.
-  // grid_area is the number of CGRA cells in the multi-CGRA grid.
-  // For large grids task_count << grid_area, grid_area is enough.
-  // For small grids (e.g. 1x1 with 5 tasks) task_count dominates.
-  int grid_area = grid_rows_ * grid_cols_;
-  int max_time_slots = std::max(grid_area, total_task_count_);
-  int t_max = (mode_ == SchedulingMode::SpatialTemporal)
-                  ? t_start + max_time_slots * task_duration
-                  : 0;
+  int64_t task_duration = task_node->getDuration();
 
-  for (int t = t_start; t <= t_max; t += task_duration) {
-    int best_score = INT_MIN;
-    TaskPlacement best_at_t;
+  int64_t t_start = (mode_ == SchedulingMode::SpatialTemporal)
+                        ? computeEarliestStartTime(task_node)
+                        : 0;
 
-    for (const CgraShape &shape : shapes_to_try) {
+  // Best-scoring placement of ONE `shapes` item at `start_time`, treating the
+  // cells in `reserved` as taken. `reserved` carries the arrays of this same
+  // task placed earlier in this attempt: they are not in `cgra_occupancy_` yet,
+  // because nothing is committed until the whole set is known to fit.
+  auto bestItemAt = [&](llvm::ArrayRef<CgraShape> shapes, int64_t start_time,
+                        const TaskPlacement &reserved) -> TaskPlacement {
+    TaskPlacement best;
+    int64_t best_score = INT64_MIN;
+    for (const CgraShape &shape : shapes) {
       SmallVector<std::pair<int, int>> shape_offsets;
       if (shape.is_rectangular) {
         for (int r = 0; r < shape.rows; ++r) {
@@ -938,27 +1425,107 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
             int abs_col = origin_col + col_off;
             if (abs_row < 0 || abs_row >= grid_rows_ || abs_col < 0 ||
                 abs_col >= grid_cols_ ||
-                isOccupied(abs_row, abs_col, t, task_duration)) {
+                isOccupied(abs_row, abs_col, start_time, task_duration)) {
               valid = false;
               break;
             }
-            candidate.cgra_positions.push_back(
-                {abs_row, abs_col, t, task_duration, 0});
+            CgraPosition position{abs_row, abs_col, start_time, task_duration,
+                                  0};
+            if (llvm::is_contained(reserved.cgra_positions, position)) {
+              valid = false;
+              break;
+            }
+            candidate.cgra_positions.push_back(position);
           }
           if (!valid) {
             continue;
           }
-          int score = computeScore(task_node, candidate, graph);
+          int64_t score = computeScore(task_node, candidate, graph);
           if (score > best_score) {
             best_score = score;
-            best_at_t = candidate;
+            best = candidate;
           }
         }
       }
     }
+    return best;
+  };
 
-    if (!best_at_t.cgra_positions.empty()) {
-      return best_at_t;
+  // Candidate start times.
+  //
+  // The earliest time a task can start is `t_start` or the instant some cell
+  // frees up, and nothing in between: within a gap between two occupancy
+  // events the feasible set does not change, so any later time in that gap is
+  // dominated. Enumerating the occupancy END times therefore covers every
+  // placement a finer search could find, exactly, with at most one candidate
+  // per already-placed interval.
+  //
+  // The previous form swept `t_start, t_start + d, t_start + 2d, ...` up to
+  // `max(grid_area, task_count) * d`, i.e. it measured the horizon in units of
+  // THIS task's duration. That holds only when tasks have similar durations.
+  // On a GPT-2 block they do not: a 768x768x768 projection occupies a cell for
+  // ~10^8 cycles while a residual add runs for ~10^5, so the short task ran out
+  // of horizon long before the long one released the grid, findBestPlacement
+  // returned empty, and the scheduler asserted.
+  SmallVector<int64_t> candidate_times;
+  candidate_times.push_back(t_start);
+  if (mode_ == SchedulingMode::SpatialTemporal) {
+    for (const auto &row : cgra_occupancy_)
+      for (const auto &cell : row)
+        for (auto [occupied_start, occupied_end] : cell)
+          if (occupied_end > t_start)
+            candidate_times.push_back(occupied_end);
+    llvm::sort(candidate_times);
+    candidate_times.erase(llvm::unique(candidate_times), candidate_times.end());
+  }
+
+  // The whole data-parallel set is placed at one instant or not at all.
+  //
+  // Every replica runs the same configuration on a disjoint partition of the
+  // same iteration space, so they are resident together. Placing the first
+  // replica where it scored best and pinning the rest into the remainder placed
+  // them against a grid the first replica had itself fragmented: on gesummv
+  // three tiles held 12 of 16 cells as six scattered 1x2 arrays, and the fourth
+  // tile placed one array and then found its two free cells at (1,0) and (3,3),
+  // which are not adjacent, so its second replica was dropped. `est_latency`
+  // still divided the trip count by two and the interval analysis reads that
+  // attribute, so the row reported the latency of work no hardware performs.
+  //
+  // Trying the compact form first and the scattered form second means a set
+  // that only fits scattered still lands at the same instant it used to, and
+  // one that fits either way takes the form that leaves the grid packable.
+  TaskPlacement best_partial;
+  int best_partial_count = 0;
+  for (int64_t candidate_start_time : candidate_times) {
+    if (!set_shapes.empty()) {
+      TaskPlacement whole =
+          bestItemAt(set_shapes, candidate_start_time, TaskPlacement{});
+      if (!whole.cgra_positions.empty()) {
+        if (replicas_placed)
+          *replicas_placed = replicas;
+        return whole;
+      }
+    }
+
+    TaskPlacement accumulated;
+    int placed = 0;
+    for (int replica_idx = 0; replica_idx < replicas; ++replica_idx) {
+      TaskPlacement one =
+          bestItemAt(shapes_to_try, candidate_start_time, accumulated);
+      if (one.cgra_positions.empty())
+        break;
+      accumulated.cgra_positions.append(one.cgra_positions.begin(),
+                                        one.cgra_positions.end());
+      ++placed;
+    }
+    if (placed == replicas) {
+      if (replicas_placed)
+        *replicas_placed = placed;
+      return accumulated;
+    }
+    if (placed > best_partial_count) {
+      best_partial_count = placed;
+      best_partial = accumulated;
     }
 
     if (mode_ == SchedulingMode::Spatial) {
@@ -966,7 +1533,11 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
     }
   }
 
-  return TaskPlacement{};
+  // No instant holds the whole set. The grid -- not the cost model -- has the
+  // final say, so the caller is handed what fits and told how much that was.
+  if (replicas_placed)
+    *replicas_placed = best_partial_count;
+  return best_partial;
 }
 
 CgraShape TaskScheduler::parseCgraShapeToBase(StringRef cgra_shape,
@@ -1075,15 +1646,27 @@ SmallVector<CgraShape> TaskScheduler::rotationsOf(const CgraShape &base) {
 //                   task in a different context.
 //
 // Higher score is better; 0 means all neighbours are co-located.
-int TaskScheduler::computeScore(TaskNode *task_node,
-                                const TaskPlacement &placement,
-                                TaskMemoryGraph &graph) {
+int64_t TaskScheduler::computeScore(TaskNode *task_node,
+                                    const TaskPlacement &placement,
+                                    TaskMemoryGraph &graph) {
   // Weight constants (tunable).
-  constexpr int kAlpha = 10;   // SSA proximity weight.
-  constexpr int kBeta = 50;    // Memory proximity weight (high priority).
-  constexpr int kGamma = 1000; // Context switch cost is higher than NoC.
+  constexpr int64_t kAlpha = 10;   // SSA proximity weight.
+  constexpr int64_t kBeta = 50;    // Memory proximity weight (high priority).
+  constexpr int64_t kGamma = 1000; // Context switch cost is higher than NoC.
 
-  int ssa_score = 0, mem_score = 0, context_reuse_penalty = 0;
+  // Weights each memory-proximity penalty by the transferred DATA VOLUME
+  // (memref element count), so the placement minimises
+  // sum(volume * manhattan_distance) -- communication -- instead of counting
+  // every memref equally, which is what the shipped scorer does.
+  const bool comm_aware = comm_aware_;
+  auto memrefElementCount = [](MemoryNode *mem) -> int64_t {
+    if (auto shaped_type = llvm::dyn_cast<ShapedType>(mem->memref.getType()))
+      if (shaped_type.hasStaticShape())
+        return std::max<int64_t>(1, shaped_type.getNumElements());
+    return 1;
+  };
+
+  int64_t ssa_score = 0, mem_score = 0, context_reuse_penalty = 0;
 
   auto minDistToPlacement = [&](const SmallVector<CgraPosition> &other) -> int {
     int min_dist = INT_MAX;
@@ -1117,17 +1700,20 @@ int TaskScheduler::computeScore(TaskNode *task_node,
   }
 
   // 2. Memory proximity — penalise distance to assigned SRAMs.
-  // For read memrefs (data sources).
+  // OURS: comm-aware weights the penalty by the memref volume (data size);
+  // baseline uses 1. For read memrefs (data sources).
   for (MemoryNode *mem : task_node->read_memrefs) {
     if (mem->assigned_sram_pos) {
-      mem_score -= minDistToTarget(*mem->assigned_sram_pos);
+      int64_t transfer_volume = comm_aware ? memrefElementCount(mem) : 1;
+      mem_score -= transfer_volume * minDistToTarget(*mem->assigned_sram_pos);
     }
   }
   // For write memrefs: if the SRAM is already assigned (e.g. read by a
   // previous task), we want to be close to it too.
   for (MemoryNode *mem : task_node->write_memrefs) {
     if (mem->assigned_sram_pos) {
-      mem_score -= minDistToTarget(*mem->assigned_sram_pos);
+      int64_t transfer_volume = comm_aware ? memrefElementCount(mem) : 1;
+      mem_score -= transfer_volume * minDistToTarget(*mem->assigned_sram_pos);
     }
   }
 

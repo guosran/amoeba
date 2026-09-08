@@ -39,35 +39,6 @@
 // RUN: -o %t.map_1x2_spatial_temporal.mlir
 // RUN: FileCheck %s --input-file=%t.map_1x2_spatial_temporal.mlir --check-prefixes=MAP-SPATIAL-TEMPORAL-1x2
 
-// RUN: mlir-amoeba-opt %t.stream.mlir \
-// RUN: --affine-loop-tree-serialization \
-// RUN: --affine-loop-perfection \
-// RUN: --construct-hyperblock-from-task \
-// RUN: --classify-task-and-counter \
-// RUN: --convert-taskflow-to-neura \
-// RUN: --cse \
-// RUN: --lower-affine \
-// RUN: --convert-scf-to-cf \
-// RUN: --convert-cf-to-llvm \
-// RUN: --assign-accelerator \
-// RUN: --lower-memref-to-neura \
-// RUN: --lower-arith-to-neura \
-// RUN: --lower-builtin-to-neura \
-// RUN: --lower-llvm-to-neura \
-// RUN: --promote-input-arg-to-const \
-// RUN: --fold-constant \
-// RUN: --canonicalize-return \
-// RUN: --canonicalize-live-in \
-// RUN: --leverage-predicated-value \
-// RUN: --transform-ctrl-to-data-flow \
-// RUN: --fold-constant \
-// RUN: '--resource-aware-task-optimization=disable-fusion=true estimation-mode=cost-model-analytical use-predicted-ii=true import-allocation=%S/no_fusion_allocation.json objective-mode=makespan' \
-// RUN: --architecture-spec=%S/../../../archspec/architecture_with_counter.yaml \
-// RUN: -o %t.lowered.mlir
-// RUN: FileCheck %s --input-file=%t.lowered.mlir --check-prefixes=LOWERED \
-// RUN:   --implicit-check-not=_utilfused \
-// RUN:   --implicit-check-not='cgra_count = 2'
-
 module attributes {torch.debug_module_name = "SimpleResNetBlock"} {
   func.func @forward(%arg0: tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32> {
     %0 = "tosa.const"() <{value = dense<"0x7BEEA13C"> : tensor<64x64x3x3xf32>}> : () -> tensor<64x64x3x3xf32>

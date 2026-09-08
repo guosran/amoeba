@@ -80,7 +80,7 @@ FailureOr<std::string> currentArchitectureSha256(std::string &error) {
 // Converts the physical CGRA rectangle into the string stored in the
 // Taskflow `cgra_shape` attribute, such as `1x2`.
 std::string RectShape::toCgraShapeAttrValue() const {
-  return std::to_string(rows) + "x" + std::to_string(cols);
+  return taskflow::formatRectangularCgraShape(rows, cols);
 }
 
 // Resolves the trip count that analytical DSE stores with each task. An
@@ -88,21 +88,12 @@ std::string RectShape::toCgraShapeAttrValue() const {
 // Taskflow counter chain supplies the count. A task with no Taskflow counter
 // represents one execution at this layer, while a dynamic or invalid counter
 // fails because treating it as one would produce an incorrect score.
-static FailureOr<int64_t> taskTripCount(TaskflowTaskOp task,
-                                        std::string &error) {
+static FailureOr<int64_t> resolveAnalyticalTripCount(TaskflowTaskOp task,
+                                                     std::string &error) {
   // TODO: add an explicit runtime-parameter contract before admitting dynamic
   // trip counts. The current static-shape protocol must fail rather than guess.
-  if (auto attr = task->getAttrOfType<IntegerAttr>("trip_count")) {
-    if (attr.getInt() <= 0) {
-      error =
-          "task " + task.getTaskName().str() + " has non-positive trip_count";
-      return failure();
-    }
-    return attr.getInt();
-  }
-
   FailureOr<std::optional<int64_t>> inferred =
-      inferStaticTaskTripCount(task, error);
+      resolveStaticTaskTripCount(task, error);
   if (failed(inferred)) {
     error += "; add an explicit positive trip_count or resolve the counter "
              "bounds first";
@@ -141,24 +132,21 @@ static std::string taskBodySha256(TaskflowTaskOp task) {
 // Collects task names, operations, and static trip counts in walk order. The
 // order is the task axis used by shape-tuple enumeration, so duplicate names
 // are rejected before they can make a cost lookup ambiguous.
-FailureOr<SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
-                                                  std::string &error) {
+FailureOr<SmallVector<TaskFact>>
+collectAnalyticalTaskFacts(func::FuncOp func, std::string &error) {
   SmallVector<TaskFact> tasks;
   llvm::StringSet<> names;
-  WalkResult walkResult = func.walk([&](TaskflowTaskOp task) {
+  for (TaskflowTaskOp task : collectTaskflowTasks(func)) {
     std::string name = task.getTaskName().str();
     if (!names.insert(name).second) {
       error = "duplicate task name " + name;
-      return WalkResult::interrupt();
+      return failure();
     }
-    FailureOr<int64_t> tripCount = taskTripCount(task, error);
+    FailureOr<int64_t> tripCount = resolveAnalyticalTripCount(task, error);
     if (failed(tripCount))
-      return WalkResult::interrupt();
+      return failure();
     tasks.push_back({task, std::move(name), taskBodySha256(task), *tripCount});
-    return WalkResult::advance();
-  });
-  if (walkResult.wasInterrupted())
-    return failure();
+  }
   if (tasks.empty()) {
     error = "function contains no taskflow.task operations";
     return failure();
@@ -181,6 +169,10 @@ SmallVector<RectShape> enumerateStaticRectShapes(int64_t gridRows,
                                                  int64_t perCgraRows,
                                                  int64_t perCgraCols,
                                                  int64_t maxCgrasPerTask) {
+  // TODO: If allocation dimensions ever become runtime parameters, represent
+  // them symbolically and define how a finite DSE domain is bounded. The
+  // current manifest intentionally contains only concrete integer rectangles;
+  // for example, `1x2` is legal while `1xN` is not a candidate shape.
   SmallVector<RectShape> result;
   if (gridRows <= 0 || gridCols <= 0 || perCgraRows <= 0 || perCgraCols <= 0 ||
       maxCgrasPerTask <= 0)
@@ -254,11 +246,18 @@ static bool placeRectangles(size_t rectangleIndex,
   return false;
 }
 
-// Returns true only when all selected task rectangles can occupy the physical
-// grid at the same time. The area check is a cheap necessary condition. The
-// backtracking placement is still required because, for example, a horizontal
-// 1x4 rectangle and a vertical 4x1 rectangle have total area eight but cannot
-// coexist on a 4x4 grid: they must intersect in one cell.
+// TODO: Replace this temporary simultaneous-packing filter with analytical
+// spatial-temporal scheduling. The future scheduler should retain every tuple
+// whose individual shapes fit the grid, then evaluate placement, temporal
+// reuse, and communication jointly. For example, two 4x4 tasks do not fit on a
+// 4x4 grid at the same time, but are legal when the second task reuses the grid
+// after the first task finishes. Until that scheduler exists, this function
+// conservatively requires every task rectangle to be resident simultaneously.
+//
+// The area check below is only a cheap necessary condition. The backtracking
+// placement is still required because, for example, a horizontal 1x4 rectangle
+// and a vertical 4x1 rectangle have total area eight but cannot coexist on a
+// 4x4 grid: they must intersect in one cell.
 static bool canPackSimultaneously(ArrayRef<RectShape> selected,
                                   int64_t gridRows, int64_t gridCols) {
   if (gridRows <= 0 || gridCols <= 0 ||
@@ -611,6 +610,9 @@ static bool validateHeaderTasks(const llvm::json::Object &object,
 // dimensions. The explicit tile rows and columns are the mapper-shape truth.
 static bool parseShape(const llvm::json::Object &object, RectShape &shape,
                        std::string &error) {
+  // TODO: Keep symbolic/dynamic allocation shapes out of this reader until
+  // the manifest has a finite-domain contract for them. Every current shape
+  // field is a concrete positive integer and is validated redundantly below.
   auto kind = requiredString(object, "kind", error);
   auto rows = requiredInteger(object, "rows", error);
   auto cols = requiredInteger(object, "cols", error);
@@ -947,19 +949,14 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
   llvm::json::Object *architectureContract =
       metadata->getObject("architecture_contract");
   llvm::json::Object *rankingPolicy = metadata->getObject("ranking_policy");
-  if (!candidateSha || !provenance || !architectureContract || !rankingPolicy)
+  if (!candidateSha || !provenance || !architectureContract)
     return false;
   auto architectureSha =
       requiredString(*provenance, "architecture_sha256", error);
   llvm::json::Object *taskBodyHashes =
       provenance->getObject("task_body_sha256");
   llvm::json::Object *taskHashes = provenance->getObject("task_dfg_sha256");
-  auto successRole =
-      requiredString(*rankingPolicy, "mapper_success_probability", error);
-  std::optional<bool> usesSuccess =
-      rankingPolicy->getBoolean("uses_mapper_success_probability");
-  if (!architectureSha || !taskBodyHashes || !taskHashes || !successRole ||
-      !usesSuccess)
+  if (!architectureSha || !taskBodyHashes || !taskHashes)
     return false;
   if (!isSha256(*candidateSha) || !isSha256(*architectureSha)) {
     error = "cost catalogue provenance contains an invalid SHA-256";
@@ -987,10 +984,28 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
             "supported architecture contract";
     return false;
   }
-  if (*successRole != "diagnostic_only" || *usesSuccess) {
-    error = "cost catalogue must keep mapper success probability "
-            "diagnostic-only";
-    return false;
+  // Mapping success probability is not part of the current objective. Older
+  // or diagnostic-producing adapters may still describe it, but a catalogue
+  // must never request that the C++ scorer use it for rejection or ranking.
+  if (rankingPolicy) {
+    if (const llvm::json::Value *role =
+            rankingPolicy->get("mapper_success_probability")) {
+      std::optional<StringRef> value = role->getAsString();
+      if (!value || *value != "diagnostic_only") {
+        error = "cost catalogue may expose mapper success probability only "
+                "as a diagnostic";
+        return false;
+      }
+    }
+    if (const llvm::json::Value *uses =
+            rankingPolicy->get("uses_mapper_success_probability")) {
+      std::optional<bool> value = uses->getAsBoolean();
+      if (!value || *value) {
+        error = "cost catalogue cannot use mapper success probability for "
+                "scoring";
+        return false;
+      }
+    }
   }
 
   if (taskBodyHashes->size() != expectedTasks.size() ||

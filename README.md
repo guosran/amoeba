@@ -6,9 +6,11 @@ transformations, and the integration layer used to connect Taskflow programs
 to architecture-specific backends.
 
 [Neura](https://github.com/coredac/neura) is currently the first supported
-backend and is consumed as a pinned Git submodule. The project is structured
-so that additional spatial dataflow backends can be integrated without moving
-architecture-specific concepts into the Taskflow core.
+backend and is consumed as a pinned Git submodule. The analytical task DSE also
+pins [cgra-ii-predictor](https://github.com/guosran/cgra-ii-predictor), which
+predicts the compiled II of each `(task DFG, mapper shape)` query. The project
+is structured so that additional spatial dataflow backends can be integrated
+without moving architecture-specific concepts into the Taskflow core.
 
 ## Architecture
 
@@ -50,7 +52,8 @@ amoeba/
 |   |-- Conversion/            # Backend-independent conversions
 |   `-- Backend/               # Backend adapter implementations
 |-- thirdparty/
-|   `-- neura/                 # Neura Git submodule
+|   |-- neura/                 # Neura Git submodule
+|   `-- cgra-ii-predictor/     # Frozen II model and Python adapter submodule
 |-- tools/
 |   `-- mlir-amoeba-opt/       # Amoeba optimizer driver
 `-- test/                      # Core, conversion, end-to-end, and backend tests
@@ -68,6 +71,9 @@ Amoeba requires:
   and
 - Git submodule support.
 
+Running analytical task DSE additionally requires Python 3 and PyTorch as
+declared by `thirdparty/cgra-ii-predictor/pyproject.toml`.
+
 This is the same LLVM revision used by the current
 [Neura build instructions](https://github.com/coredac/neura#build-llvm--neura)
 and [Amoeba CI](.github/workflows/main.yml).
@@ -81,12 +87,15 @@ git clone --recurse-submodules git@github.com:coredac/amoeba.git
 cd amoeba
 ```
 
-For an existing checkout, initialize or update the pinned Neura revision with:
+For an existing checkout, initialize or update the pinned dependencies with:
 
 ```bash
 git submodule update --init --recursive
 git submodule status
 ```
+
+The predictor's nested training-data submodules are not required for
+inference. Initializing Amoeba's direct submodules is sufficient.
 
 ## Build LLVM and MLIR
 
@@ -168,6 +177,43 @@ For example, an affine program can be converted to Taskflow with:
 Neura-specific passes and options are registered by the Neura adapter. The
 architecture and latency options are exposed as `--neura-architecture-spec`
 and `--neura-latency-spec`.
+
+## Analytical task DSE
+
+`tools/run-analytical-task-dse.py` connects the Amoeba passes to the pinned ML
+model. It enumerates every currently legal static shape candidate, computes
+each unique task-shape feature once, predicts II, scores the complete candidate
+set, and invokes the forwarded real pipeline only for the top-k shortlist.
+
+The input must contain Taskflow tasks with pre-mapper Neura kernels. For
+example:
+
+```bash
+./tools/run-analytical-task-dse.py prepared-taskflow.mlir \
+  --architecture test/archspec/architecture.yaml \
+  --top-k 1 \
+  --output-dir /tmp/amoeba-shape-dse \
+  -- \
+  '--orchestrate-tasks-on-accelerators=scheduling-mode=spatial'
+```
+
+Everything after `--` runs once for each shortlisted candidate. With no
+forwarded arguments, the driver stops after materializing the shortlist, which
+is useful for inspecting the selected `cgra_count` and `cgra_shape`
+attributes.
+
+The current search varies only static, oriented rectangular task shapes and
+requires all task rectangles to fit simultaneously. TODO: add analytical
+spatial-temporal scheduling so sequential tasks can reuse the same tiles; then
+extend the candidate axes with fusion, fission, tiling, placement, and
+communication cost. Symbolic allocation shapes remain unsupported until a
+finite candidate-domain contract is defined.
+
+The checked-in predictor currently accepts the exact architecture used for
+its training labels (`test/archspec/architecture.yaml`). TODO: collect labels
+and retrain for the intended multi-CGRA architecture before using
+`architecture_4x4.yaml`; the adapter intentionally rejects an untrained
+architecture instead of silently producing an invalid ranking.
 
 ## Tests
 

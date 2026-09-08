@@ -6,6 +6,7 @@
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -60,6 +61,11 @@ struct CgraShape {
   std::string irAttr() const;
 };
 
+// Formats a rectangular physical shape for the Taskflow `cgra_shape`
+// attribute. Kept independent of CgraShape so protocol code using checked
+// 64-bit dimensions does not need a lossy conversion to the placement type.
+std::string formatRectangularCgraShape(int64_t rows, int64_t cols);
+
 // Shape enumeration utilities.
 
 // Generates every rectangular shape for a CGRA count within the given grid.
@@ -86,6 +92,35 @@ llvm::SmallVector<CgraShape> getAllPlacementShapes(int cgra_count);
 // for static analytical DSE; it never substitutes a guessed count.
 FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
                                                            std::string &error);
+
+// Resolves the static Taskflow-level trip count without guessing. An explicit
+// positive `trip_count` attribute wins; otherwise the count is inferred from
+// Taskflow counters. Returns std::nullopt when neither source exists so callers
+// can choose an appropriate layer-specific default or fallback.
+FailureOr<std::optional<int64_t>>
+resolveStaticTaskTripCount(TaskflowTaskOp task, std::string &error);
+
+// Returns Taskflow tasks in deterministic walk order. Analyses that need
+// protocol-specific facts should build those facts on top of this common task
+// discovery helper instead of open-coding another func.walk().
+llvm::SmallVector<TaskflowTaskOp> collectTaskflowTasks(func::FuncOp func);
+
+// Writes the two attributes that describe one task's physical CGRA rectangle.
+// For example, cgra_count=2 and cgra_shape="1x2" bind a horizontal pair. This
+// helper deliberately does not write placement coordinates, replicas, or the
+// analytical orientation lock because those belong to their owning passes.
+void setTaskResourceShape(TaskflowTaskOp task, int cgraCount,
+                          StringRef cgraShape);
+
+// Stable key for one physical CGRA coordinate. Scheduling and post-schedule
+// analysis share this helper so they group exactly the same cells.
+int64_t encodeCgraLocation(int row, int col);
+
+// Returns the partition group written by task fission, or -1 for an ordinary
+// task. A missing `tile_parallel` attribute means the group is parallel-safe;
+// an explicit false value preserves the intra-group execution order.
+int getTaskTileGroup(TaskflowTaskOp task);
+bool isParallelTaskTile(TaskflowTaskOp task);
 
 // Global placement feasibility.
 
@@ -129,6 +164,127 @@ class TaskMemoryGraph;
 // Caller-provided task priority; higher values are scheduled earlier.
 using TaskPriorityMap = llvm::DenseMap<Operation *, int>;
 
+// Concrete schedule result for one task after TaskScheduler placement.
+// Times and durations are 64-bit because they are cycle counts of whole
+// kernels, not op counts. A GPT-2 prefill block already measures 1.85e9 cycles,
+// 86% of INT32_MAX, and start times accumulate along a path, so 32-bit
+// arithmetic here overflows on the programs this compiler is meant for.
+struct TaskScheduleResult {
+  // One CGRA cell occupied by this task.
+  struct CgraOccupancy {
+    int row = 0;
+    int col = 0;
+    int64_t start_time = 0;
+    int64_t duration = 1;
+    int context_id = 0;
+  };
+
+  TaskflowTaskOp task;
+  int64_t start_time = 0;
+  int64_t duration = 1;
+  int64_t end_time = 1;
+  llvm::SmallVector<CgraOccupancy> cgra_occupancies;
+  llvm::SmallVector<TaskflowTaskOp> predecessor_tasks;
+  llvm::SmallVector<TaskflowTaskOp> successor_tasks;
+};
+
+// Pipeline interval analysis result for a concrete task schedule.
+struct TaskPipelineIntervalResult {
+  int64_t pipeline_interval = 0;
+  TaskflowTaskOp bottleneck_task;
+  llvm::SmallVector<TaskflowTaskOp> critical_path;
+};
+
+// Builds a task-level schedule analysis graph and derives the steady-state
+// pipeline interval for the concrete schedule produced by TaskScheduler.
+//
+// The graph nodes are the scheduled tasks for one input instance. The graph
+// contains two kinds of execution-order edges:
+//
+//   1. Data-dependence edges.
+//      If T1 consumes a value/token produced by T0, add T0 -> T1 with latency
+//      latency(T0). This says T1 cannot execute until T0 has completed.
+//
+//   2. CGRA execution-order edges.
+//      If a physical CGRA runs T0 before T2 for the same input instance, add
+//      T0 -> T2 with latency latency(T0). This says T2 cannot use that CGRA
+//      until T0 releases its context slot.
+//
+// The graph gives ordering within one input instance. To compute steady-state
+// throughput, each CGRA also defines a pipeline cycle: the last task using
+// that CGRA for this input instance must finish before the first task using
+// that same CGRA for the next input instance can start.
+//
+//      first_task(this input) -> ... -> last_task(this input)
+//      last_task(this input)  -> first_task(next input)
+//
+// The interval required by that CGRA is the latency of the longest path from
+// first_task to last_task in the analysis graph, plus latency(last_task) for
+// the transition to the next input instance. The overall pipeline interval is
+// the maximum interval over all CGRA pipeline cycles.
+//
+// Example:
+//   Data dependence: T0 -> T1 -> T2
+//   Placement:       T0 on CGRA0, T1 on CGRA1, T2 on CGRA0
+//
+// The analysis graph contains data-dependence edges T0 -> T1 and T1 -> T2.
+// Since T0 and T2 reuse CGRA0 in order, it also contains a CGRA
+// execution-order edge T0 -> T2. CGRA0 then defines the pipeline cycle
+// T0(this input) -> T1 -> T2 -> T0(next input), requiring
+// latency(T0)+latency(T1)+latency(T2).
+class TaskPipelineIntervalAnalyzer {
+public:
+  explicit TaskPipelineIntervalAnalyzer(
+      llvm::ArrayRef<TaskScheduleResult> schedule_result);
+
+  TaskPipelineIntervalResult analyze();
+
+private:
+  // Edge in the analysis graph that says `task` must execute before
+  // `next_task`. It is created either by a data dependence or by sequential
+  // reuse of the same CGRA context.
+  // An edge between two TASK INDICES into `schedule_result_`, not between task
+  // ops. `latency` is the source task's duration.
+  struct ExecutionOrderEdge {
+    int next_task_idx = -1;
+    int64_t latency = 0;
+  };
+
+  // Pipeline cycle induced by one physical CGRA. `last_task` is the final task
+  // using that CGRA for this input instance, and `first_task` is the first task
+  // using that same CGRA for the next input instance.
+  // The cycle one physical CGRA closes: its last task feeds the next input's
+  // first task. Both fields are indices into `schedule_result_`.
+  struct CgraPipelineCycle {
+    int last_task_idx = -1;
+    int first_task_idx = -1;
+    int64_t latency = 0;
+  };
+
+  // Longest execution-order path found between two task nodes.
+  // Longest path to a target, as TASK INDICES.
+  struct LongestExecutionPath {
+    bool found = false;
+    int64_t total_latency = 0;
+    llvm::SmallVector<int> path;
+  };
+
+  int64_t getTaskDuration(int task_idx) const;
+  void addExecutionOrderEdge(int task_idx, int next_task_idx);
+  void buildTaskIndex();
+  void buildDataDependenceEdges();
+  void buildCgraExecutionOrderEdgesAndPipelineCycles();
+  LongestExecutionPath findLongestPathToTarget(
+      int current_task_idx, int target_task_idx, llvm::DenseSet<int> &visiting,
+      llvm::DenseMap<int, LongestExecutionPath> &memo) const;
+  TaskPipelineIntervalResult computeLongestPipelineCycle() const;
+
+  llvm::ArrayRef<TaskScheduleResult> schedule_result_;
+  llvm::DenseMap<Operation *, int> task_to_index_;
+  llvm::SmallVector<llvm::SmallVector<ExecutionOrderEdge>> task_graph_;
+  llvm::SmallVector<CgraPipelineCycle> cgra_pipeline_cycles_;
+};
+
 // Reusable one-shot scheduler/placer for Taskflow task graphs.
 //
 // Builds the task-memory graph, schedules tasks using the provided priority,
@@ -136,24 +292,37 @@ using TaskPriorityMap = llvm::DenseMap<Operation *, int>;
 // task_orchestration_info/profile_info metadata.
 class TaskScheduler {
 public:
+  // `comm_aware` weights each memory-proximity penalty by the transferred
+  // data volume instead of counting every memref equally, so the placement
+  // minimises sum(volume * distance) rather than sum(distance). Off by default:
+  // it changes the placement the in-tree expectations pin.
   TaskScheduler(int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
-                SchedulingMode mode = SchedulingMode::SpatialTemporal);
+                SchedulingMode mode = SchedulingMode::SpatialTemporal,
+                bool comm_aware = false);
 
   // Schedules and places all Taskflow tasks in `func` using the caller-provided
   // task priority map.
   bool schedule(func::FuncOp func, const TaskPriorityMap &priority);
 
+  // Returns the concrete task schedule produced by schedule().
+  llvm::ArrayRef<TaskScheduleResult> getScheduleResult() const {
+    return schedule_result_;
+  }
+
 private:
+  // Records concrete schedule facts from the internal task placement.
+  void recordScheduleResult(const TaskMemoryGraph &graph);
+
   // Returns true if a CGRA grid coordinate is inside the configured grid.
   bool posInBounds(const CgraPosition &pos) const;
 
   // Returns true if a CGRA cell is already occupied during the requested
   // time interval.
-  bool isOccupied(int row, int col, int start_time, int duration) const;
+  bool isOccupied(int row, int col, int64_t start_time, int64_t duration) const;
 
   // Marks a CGRA cell as occupied for the half-open interval
   // [start_time, start_time + duration).
-  void markOccupied(int row, int col, int start_time, int duration);
+  void markOccupied(int row, int col, int64_t start_time, int64_t duration);
 
   // Clears all task placements and CGRA occupancy state before another
   // fixed-point placement iteration.
@@ -161,7 +330,7 @@ private:
 
   // Computes the earliest start time allowed by already-placed predecessor
   // tasks.
-  int computeEarliestStartTime(const TaskNode *task_node) const;
+  int64_t computeEarliestStartTime(const TaskNode *task_node) const;
 
   // Assigns every memory node to the SRAM location closest to its accessing
   // tasks and returns whether any assignment changed.
@@ -169,8 +338,20 @@ private:
 
   // Searches legal grid positions and returns the best-scoring placement for
   // one task under the current scheduling mode.
+  //
+  // `replicas` places the task's whole data-parallel set: the returned
+  // placement covers `cgra_count * replicas` cells, all at one instant,
+  // preferring the compact form (the set as one rectangle) over the scattered
+  // one. `replicas_placed` receives how many of them the grid took, which is
+  // fewer than asked only when no instant holds the whole set.
   TaskPlacement findBestPlacement(TaskNode *task_node, int cgra_count,
-                                  TaskMemoryGraph &graph);
+                                  TaskMemoryGraph &graph, int replicas = 1,
+                                  int *replicas_placed = nullptr);
+
+  // Rectangles that hold `replicas` copies of `base`, most-square first.
+  // Empty when `base` is not rectangular.
+  llvm::SmallVector<CgraShape> replicaSetShapes(const CgraShape &base,
+                                                int replicas);
 
   // Parses a cgra_shape attribute string into its base placement shape.
   CgraShape parseCgraShapeToBase(StringRef cgra_shape, int cgra_count);
@@ -180,14 +361,17 @@ private:
 
   // Scores a candidate placement using proximity to dependent tasks, assigned
   // SRAMs, and context reuse cost.
-  int computeScore(TaskNode *task_node, const TaskPlacement &placement,
-                   TaskMemoryGraph &graph);
+  int64_t computeScore(TaskNode *task_node, const TaskPlacement &placement,
+                       TaskMemoryGraph &graph);
 
   int grid_rows_;
   int grid_cols_;
   SchedulingMode mode_;
+  bool comm_aware_ = false;
   int total_task_count_ = 0;
-  std::vector<std::vector<llvm::SmallVector<std::pair<int, int>, 4>>>
+  llvm::SmallVector<TaskScheduleResult> schedule_result_;
+  // Half-open [start, end) busy intervals per cell, in cycles.
+  std::vector<std::vector<llvm::SmallVector<std::pair<int64_t, int64_t>, 4>>>
       cgra_occupancy_;
 };
 

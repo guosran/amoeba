@@ -82,7 +82,8 @@ struct ScoreAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
 
-    FailureOr<SmallVector<TaskFact>> taskFacts = collectTaskFacts(func, error);
+    FailureOr<SmallVector<TaskFact>> taskFacts =
+        collectAnalyticalTaskFacts(func, error);
     if (failed(taskFacts)) {
       func.emitError() << error;
       return signalPassFailure();

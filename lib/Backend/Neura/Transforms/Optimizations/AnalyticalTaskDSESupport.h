@@ -26,6 +26,11 @@
 // the existing downstream heuristic; temporal reuse cannot make an
 // over-capacity shape tuple legal in this shape-only stage.
 //
+// TODO: Replace that temporary simultaneous-residency rule with analytical
+// spatial-temporal scheduling. For example, this stage currently rejects two
+// 4x4 tasks on a 4x4 grid, although a temporal schedule could run the second
+// task after the first one releases the grid.
+//
 // Preserves exhaustive DSE by keeping scores out of enumeration, refusing to
 // truncate oversized spaces, scoring every frozen record before sorting, and
 // validating the complete concurrently packable manifest before mutating IR.
@@ -167,8 +172,8 @@ private:
   std::map<Key, bool> results_;
 };
 
-FailureOr<llvm::SmallVector<TaskFact>> collectTaskFacts(func::FuncOp func,
-                                                        std::string &error);
+FailureOr<llvm::SmallVector<TaskFact>>
+collectAnalyticalTaskFacts(func::FuncOp func, std::string &error);
 llvm::SmallVector<RectShape> enumerateStaticRectShapes(int64_t gridRows,
                                                        int64_t gridCols,
                                                        int64_t perCgraRows,

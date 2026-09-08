@@ -7,6 +7,7 @@
 #include "AnalyticalTaskDSESupport.h"
 
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/orchestration_utils.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
@@ -77,7 +78,8 @@ struct MaterializeAnalyticalTaskCandidatePass
       return signalPassFailure();
     }
 
-    FailureOr<SmallVector<TaskFact>> taskFacts = collectTaskFacts(func, error);
+    FailureOr<SmallVector<TaskFact>> taskFacts =
+        collectAnalyticalTaskFacts(func, error);
     if (failed(taskFacts)) {
       func.emitError() << error;
       return signalPassFailure();
@@ -119,10 +121,9 @@ struct MaterializeAnalyticalTaskCandidatePass
     // heuristic mapper; this pass fabricates no placement or II.
     OpBuilder builder(func.getContext());
     for (auto [task, choice] : llvm::zip(*taskFacts, selected->choices)) {
-      task.op->setAttr("cgra_count",
-                       builder.getI32IntegerAttr(choice.shape.cgraCount()));
-      task.op->setAttr("cgra_shape", builder.getStringAttr(
-                                         choice.shape.toCgraShapeAttrValue()));
+      taskflow::setTaskResourceShape(task.op,
+                                     static_cast<int>(choice.shape.cgraCount()),
+                                     choice.shape.toCgraShapeAttrValue());
       // The ML model scored this orientation, not merely this rectangle's
       // area. The scheduler may still choose the origin, but it must not turn a
       // scored 1x4 shape into the separately scored 4x1 shape.

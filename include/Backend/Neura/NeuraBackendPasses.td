@@ -11,8 +11,7 @@ def ConvertTaskflowToNeura : Pass<"convert-taskflow-to-neura", "ModuleOp"> {
     Converts taskflow.hyperblock operations and their counters into
     neura.kernel operations suitable for CGRA tile-array mapping.
   }];
-  let constructor =
-      "::mlir::amoeba::neura::createConvertTaskflowToNeuraPass()";
+  let constructor = "::mlir::amoeba::neura::createConvertTaskflowToNeuraPass()";
   let dependentDialects = ["mlir::taskflow::TaskflowDialect",
                            "mlir::neura::NeuraDialect",
                            "mlir::affine::AffineDialect"];
@@ -36,8 +35,7 @@ def ClassifyTaskAndCounter : Pass<"classify-task-and-counter", "ModuleOp"> {
     Annotates taskflow.task and taskflow.counter operations with the
     structural and runtime-management information consumed by Neura.
   }];
-  let constructor =
-      "::mlir::amoeba::neura::createClassifyTaskAndCounterPass()";
+  let constructor = "::mlir::amoeba::neura::createClassifyTaskAndCounterPass()";
   let dependentDialects = ["mlir::affine::AffineDialect",
                            "mlir::arith::ArithDialect",
                            "mlir::func::FuncDialect",
@@ -53,13 +51,50 @@ def OrchestrateTasksOnAccelerators
     Neura multi-CGRA architecture. The current strategy prioritizes routing
     critical paths and supports spatial and spatial-temporal scheduling.
   }];
-  let options = [Option<
-      "schedulingMode", "scheduling-mode", "std::string",
-      /*default=*/"\"spatial-temporal\"",
-      "Task scheduling mode: 'spatial' (one task per CGRA) or "
-      "'spatial-temporal' (time-multiplexes CGRAs).">];
+  let options =
+      [Option<"schedulingMode", "scheduling-mode", "std::string",
+              /*default=*/"\"spatial-temporal\"",
+              "Task scheduling mode: 'spatial' (one task per CGRA) or "
+              "'spatial-temporal' (time-multiplexes CGRAs).">,
+       Option<
+           "commAware", "comm-aware", "bool", /*default=*/"false",
+           "Weight each memory-proximity penalty by transferred data volume.">];
   let constructor =
       "::mlir::amoeba::neura::createOrchestrateTasksOnAcceleratorsPass()";
+}
+
+def AnalyzeTaskPipelineInterval
+    : Pass<"analyze-task-pipeline-interval", "func::FuncOp"> {
+  let summary =
+      "Analyze the pipeline interval of already-profiled and scheduled tasks";
+  let description = [{
+    Reads taskflow.task operations that contain profile_info.duration and
+    task_orchestration_info.cgra_positions, reconstructs the concrete per-CGRA
+    context order, and emits task_pipeline_interval_info on the parent func.func.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createAnalyzeTaskPipelineIntervalPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def AnalyzeRecResMii : Pass<"analyze-rec-res-mii", "ModuleOp"> {
+  let summary = "Compute mapper-compatible RecMII and ResMII without mapping";
+  let description = [{
+    Computes the recurrence and resource lower bounds already used by Neura's
+    heuristic mapper for exactly one standalone task DFG. x-tiles and y-tiles
+    select the concrete mapper rectangle. The result is written as the
+    amoeba.rec_mii and amoeba.res_mii module attributes for the ML feature
+    adapter; this pass never places or routes an operation and therefore does
+    not perform a real mapper run.
+  }];
+  let options = [Option<"xTiles", "x-tiles", "int64_t", /*default=*/"0",
+                        "Concrete mapper tile columns; must be positive.">,
+                 Option<"yTiles", "y-tiles", "int64_t", /*default=*/"0",
+                        "Concrete mapper tile rows; must be positive.">];
+  let constructor = "::mlir::amoeba::neura::createAnalyzeRecResMiiPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::neura::NeuraDialect"];
 }
 
 def EnumerateAnalyticalTaskCandidates
@@ -80,18 +115,19 @@ def EnumerateAnalyticalTaskCandidates
     implementation fixes fusion, fission, tiling, concrete placement, and
     temporal order; later search axes extend the same contract.
   }];
-  let options = [
-    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+  let options =
+      [Option<
+           "functionName", "function", "std::string", /*default=*/"\"\"",
            "Taskflow function to process; inferred when exactly one exists.">,
-    Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
-           "Path to the candidate JSONL manifest.">,
-    Option<"maxCandidates", "max-candidates", "int64_t",
+       Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
+              "Path to the candidate JSONL manifest.">,
+       Option<
+           "maxCandidates", "max-candidates", "int64_t",
            /*default=*/"1000000",
            "Fail instead of publishing a partial manifest above this count.">,
-    Option<"maxCgrasPerTask", "max-cgras-per-task", "int64_t",
-           /*default=*/"4",
-           "Largest rectangular physical footprint to enumerate per task.">
-  ];
+       Option<"maxCgrasPerTask", "max-cgras-per-task", "int64_t",
+              /*default=*/"4",
+              "Largest rectangular physical footprint to enumerate per task.">];
   let constructor =
       "::mlir::amoeba::neura::createEnumerateAnalyticalTaskCandidatesPass()";
   let dependentDialects = ["mlir::arith::ArithDialect",
@@ -111,18 +147,19 @@ def ScoreAnalyticalTaskCandidates
     the final communication-aware pipeline interval.  The catalogue uses
     explicit mapper tile dimensions and a fixed cost schema.
   }];
-  let options = [
-    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+  let options =
+      [Option<
+           "functionName", "function", "std::string", /*default=*/"\"\"",
            "Taskflow function to process; inferred when exactly one exists.">,
-    Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
-           "Path to the frozen candidate JSONL manifest.">,
-    Option<"costFile", "cost-file", "std::string", /*default=*/"\"\"",
-           "Path to the task-shape ML cost catalogue.">,
-    Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
-           "Path to the score JSONL manifest.">,
-    Option<"topK", "top-k", "int64_t", /*default=*/"1",
-           "Number of candidates to shortlist; zero means every valid one.">
-  ];
+       Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
+              "Path to the frozen candidate JSONL manifest.">,
+       Option<"costFile", "cost-file", "std::string", /*default=*/"\"\"",
+              "Path to the task-shape ML cost catalogue.">,
+       Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
+              "Path to the score JSONL manifest.">,
+       Option<
+           "topK", "top-k", "int64_t", /*default=*/"1",
+           "Number of candidates to shortlist; zero means every valid one.">];
   let constructor =
       "::mlir::amoeba::neura::createScoreAnalyticalTaskCandidatesPass()";
   let dependentDialects = ["mlir::arith::ArithDialect",
@@ -139,16 +176,16 @@ def MaterializeAnalyticalTaskCandidate
     It does not invoke the mapper.  An external driver may therefore run this
     pass followed by the unchanged heuristic mapper exactly once per top-k ID.
   }];
-  let options = [
-    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+  let options =
+      [Option<
+           "functionName", "function", "std::string", /*default=*/"\"\"",
            "Taskflow function to process; inferred when exactly one exists.">,
-    Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
-           "Path to the frozen candidate JSONL manifest.">,
-    Option<"candidateId", "candidate-id", "std::string", /*default=*/"\"\"",
-           "Sequential candidate ID to materialize.">,
-    Option<"candidateIndex", "candidate-index", "int64_t", /*default=*/"-1",
-           "Zero-based manifest index; intended for tests/debugging.">
-  ];
+       Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
+              "Path to the frozen candidate JSONL manifest.">,
+       Option<"candidateId", "candidate-id", "std::string", /*default=*/"\"\"",
+              "Sequential candidate ID to materialize.">,
+       Option<"candidateIndex", "candidate-index", "int64_t", /*default=*/"-1",
+              "Zero-based manifest index; intended for tests/debugging.">];
   let constructor =
       "::mlir::amoeba::neura::createMaterializeAnalyticalTaskCandidatePass()";
   let dependentDialects = ["mlir::func::FuncDialect",
@@ -162,8 +199,7 @@ def FuseTask : Pass<"fuse-task", "func::FuncOp"> {
     evaluated with Neura lowering and MII metrics.
   }];
   let constructor = "::mlir::amoeba::neura::createFuseTaskPass()";
-  let dependentDialects = ["mlir::LLVM::LLVMDialect",
-                           "mlir::func::FuncDialect",
+  let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::func::FuncDialect",
                            "mlir::arith::ArithDialect",
                            "mlir::memref::MemRefDialect",
                            "mlir::neura::NeuraDialect",

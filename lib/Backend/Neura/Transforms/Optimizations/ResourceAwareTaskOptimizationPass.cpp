@@ -176,7 +176,7 @@ public:
   void build(func::FuncOp func, bool skip_mapper = false) {
     // 1. Creates TaskGraphNodes.
     size_t task_id = 0;
-    func.walk([&](TaskflowTaskOp task) {
+    for (TaskflowTaskOp task : collectTaskflowTasks(func)) {
       auto node = std::make_unique<TaskGraphNode>(task_id++, task);
 
       // If the task already has profiling attributes (e.g., from fusion),
@@ -208,7 +208,7 @@ public:
 
       op_to_node[task] = node.get();
       nodes.push_back(std::move(node));
-    });
+    }
 
     // 2. Builds SSA edges (value dependencies between tasks).
     for (auto &consumer : nodes) {
@@ -663,7 +663,7 @@ private:
   static int64_t computeTripCount(TaskflowTaskOp task) {
     std::string error;
     FailureOr<std::optional<int64_t>> taskflowCount =
-        inferStaticTaskTripCount(task, error);
+        resolveStaticTaskTripCount(task, error);
     if (failed(taskflowCount)) {
       llvm::errs() << "[computeTripCount] " << error << "\n";
       assert(false && "Expected static Taskflow counter bounds");
@@ -1576,6 +1576,22 @@ struct ResourceAwareTaskOptimizationPass
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
+    // The analytical DSE materializer has already chosen both the resource
+    // count and the oriented rectangle for each task. For example, if its
+    // selected candidate assigns task A to 1x4, running this allocator next
+    // could replace that choice with 2x2. The ML score would then describe a
+    // different candidate from the one passed to the real pipeline. Reject
+    // this ordering and let orchestration plus the unchanged heuristic mapper
+    // consume the fixed task shapes directly.
+    for (TaskflowTaskOp task : collectTaskflowTasks(func)) {
+      if (task->hasAttr("amoeba.analytical_shape_orientation_fixed")) {
+        func.emitError()
+            << "resource-aware-task-optimization cannot run after an "
+               "analytical task candidate has fixed resource shapes";
+        return signalPassFailure();
+      }
+    }
+
     bool use_analytical = (estimationMode.getValue() == "analytical");
 
     llvm::errs() << "=== ResourceAwareTaskOptimization on " << func.getName()
@@ -1697,8 +1713,8 @@ struct ResourceAwareTaskOptimizationPass
         for (auto &node : graph.nodes) {
           OpBuilder b(node->op);
           node->shape = pickBestShape(node->cgra_count);
-          node->op->setAttr("cgra_count",
-                            b.getI32IntegerAttr(node->cgra_count));
+          setTaskResourceShape(node->op, node->cgra_count,
+                               node->shape.irAttr());
           node->op->setAttr("compiled_ii", b.getI32IntegerAttr(node->ii));
           {
             SmallVector<NamedAttribute, 1> profile_attrs;
@@ -1711,10 +1727,6 @@ struct ResourceAwareTaskOptimizationPass
           }
           node->op->setAttr("trip_count",
                             b.getI32IntegerAttr(node->trip_count));
-          // Writes cgra_shape attribute: simple "NxM" bounding-box string.
-          // The detailed occupancy diagram is printed in the summary below.
-          std::string shape_str = node->shape.irAttr();
-          node->op->setAttr("cgra_shape", b.getStringAttr(shape_str));
         }
         break;
       }

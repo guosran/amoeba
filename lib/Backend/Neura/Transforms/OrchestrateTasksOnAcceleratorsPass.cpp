@@ -1,8 +1,8 @@
 // Orchestrate Taskflow tasks onto a multi-CGRA grid.
 
-#include "NeuraDialect/Architecture/Architecture.h"
-#include "Backend/Neura/Orchestration/RoutingCriticalPathOrchestration/RoutingCriticalPathOrchestration.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/RoutingCriticalPathOrchestration/RoutingCriticalPathOrchestration.h"
+#include "NeuraDialect/Architecture/Architecture.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 
@@ -38,24 +38,43 @@ struct OrchestrateTasksOnAcceleratorsPass
                      "task count is not bounded by grid size)."),
       llvm::cl::init("spatial-temporal")};
 
+  Option<bool> commAware{
+      *this, "comm-aware",
+      llvm::cl::desc("Weight each memory-proximity penalty by the transferred "
+                     "data volume, so placement minimises "
+                     "sum(volume * distance) instead of sum(distance) "
+                     "(default: false)."),
+      llvm::cl::init(false)};
+
   void runOnOperation() override {
-    SchedulingMode mode = (schedulingMode.getValue() == "spatial")
+    const StringRef scheduling_mode = schedulingMode.getValue();
+    if (scheduling_mode != "spatial" && scheduling_mode != "spatial-temporal") {
+      getOperation().emitError()
+          << "unknown scheduling-mode '" << scheduling_mode
+          << "'; expected spatial or spatial-temporal";
+      return signalPassFailure();
+    }
+    SchedulingMode mode = (scheduling_mode == "spatial")
                               ? SchedulingMode::Spatial
                               : SchedulingMode::SpatialTemporal;
     const neura::Architecture &architecture = neura::getArchitecture();
     RoutingCriticalPathOrchestration strategy(
         architecture.getMultiCgraRows(), architecture.getMultiCgraColumns(),
-        mode);
+        mode, commAware.getValue());
     strategy.runTaskOrchestration(getOperation());
   }
 };
 
 } // namespace
 
-namespace mlir::amoeba::neura {
+namespace mlir {
+namespace amoeba {
+namespace neura {
 
 std::unique_ptr<Pass> createOrchestrateTasksOnAcceleratorsPass() {
   return std::make_unique<OrchestrateTasksOnAcceleratorsPass>();
 }
 
-} // namespace mlir::amoeba::neura
+} // namespace neura
+} // namespace amoeba
+} // namespace mlir

@@ -81,7 +81,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
 
     // Collects static task facts and builds the single-task shape alphabet from
     // the architecture values read by Neura's YAML loader.
-    FailureOr<SmallVector<TaskFact>> taskFacts = collectTaskFacts(func, error);
+    FailureOr<SmallVector<TaskFact>> taskFacts =
+        collectAnalyticalTaskFacts(func, error);
     if (failed(taskFacts)) {
       func.emitError() << error;
       return signalPassFailure();
@@ -180,6 +181,13 @@ struct EnumerateAnalyticalTaskCandidatesPass
               costQueries.push_back(std::move(query));
             }
           }
+          // TODO: Turn each fixed axis below into an explicitly enumerated DSE
+          // axis once its analytical model exists. For example, a later search
+          // may compare {fuse A+B, keep A/B separate}, split A into two tiles,
+          // or schedule two 4x4 tasks in consecutive temporal slots on one 4x4
+          // grid. Communication cost must then be scored jointly because those
+          // choices change both message volume and placement distance. Today
+          // only each task's static oriented rectangle varies.
           llvm::json::Object fixedAxes;
           fixedAxes["fusion"] = "identity";
           fixedAxes["fission"] = "factor-1";

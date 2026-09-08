@@ -6,14 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "TaskflowDialect/TaskflowDialect.h"
-#include "TaskflowDialect/TaskflowOps.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Conversion/NeuraConversionPasses.h"
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraPasses.h"
+#include "TaskflowDialect/TaskflowDialect.h"
+#include "TaskflowDialect/TaskflowOps.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/Passes.h"
@@ -345,8 +345,7 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
     read_out_types.push_back(v.getType());
 
   // Write/value output types come from the consumer only.
-  SmallVector<Type> write_out_types(
-      consumer.getDoneWrites().getTypes());
+  SmallVector<Type> write_out_types(consumer.getDoneWrites().getTypes());
   SmallVector<Type> val_out_types(consumer.getValueOutputs().getTypes());
 
   SmallVector<Value> orig_reads, orig_writes;
@@ -806,7 +805,7 @@ static TaskflowTaskOp fuseSiblingTasks(TaskflowTaskOp t1, TaskflowTaskOp t2,
 // Represents metrics for evaluating fusion profitability.
 struct FusionMetrics {
   int rec_mii = 1;
-  int res_mii = 1;
+  int resource_mii = 1;
   int max_fanout = 0;
   int num_ops = 0;
 };
@@ -839,7 +838,7 @@ computeRealMetrics(ModuleOp test_module,
     pm.enableVerifier(false);
     if (failed(pm.run(cloned))) {
       metrics.rec_mii = 100;
-      metrics.res_mii = 100;
+      metrics.resource_mii = 100;
       cloned.erase();
       return metrics;
     }
@@ -878,7 +877,7 @@ computeRealMetrics(ModuleOp test_module,
     pm.enableVerifier(false);
     if (failed(pm.run(cloned))) {
       metrics.rec_mii = 100;
-      metrics.res_mii = 100;
+      metrics.resource_mii = 100;
       cloned.erase();
       return metrics;
     }
@@ -888,7 +887,8 @@ computeRealMetrics(ModuleOp test_module,
     if (func_op.getName() != "test_fused_kernel") {
       return;
     }
-    metrics.res_mii = neura::calculateResMii(func_op.getBody(), architecture);
+    metrics.resource_mii =
+        neura::calculateResMii(func_op.getBody(), architecture);
     auto cycles = neura::collectRecurrenceCycles(func_op.getBody());
     metrics.rec_mii = 1;
     for (const auto &cycle : cycles) {
@@ -1076,7 +1076,7 @@ static ModuleOp createFusedTestModule(TaskflowTaskOp task1,
   return module;
 }
 
-// Computes metrics for the fused version of two tasks.
+// Computes metrics for the fused form of two tasks.
 static FusionMetrics
 computeFusedTaskMetrics(TaskflowTaskOp task1, TaskflowTaskOp task2,
                         bool is_producer_consumer, Value intermediate_memref,
@@ -1092,7 +1092,7 @@ computeFusedTaskMetrics(TaskflowTaskOp task1, TaskflowTaskOp task2,
 static int estimateMII(const FusionMetrics &metrics, int total_tiles) {
   const float alpha = 0.5f;
   const float beta = 0.5f;
-  int mii = std::max(metrics.rec_mii, metrics.res_mii);
+  int mii = std::max(metrics.rec_mii, metrics.resource_mii);
   float utilization_factor =
       1.0f + alpha * (metrics.num_ops / static_cast<float>(total_tiles));
   float fanout_factor = 1.0f + beta * std::max(metrics.max_fanout - 4, 0);
@@ -1120,24 +1120,24 @@ static bool isFusionProfitable(TaskflowTaskOp task1, TaskflowTaskOp task2,
 
   // Uses raw MII (max of recurrence and resource MII) for the core
   // comparison, since the estimateMII utilization penalty is additive
-  // and already reflected in res_mii.
-  int raw_1 = std::max(m1.rec_mii, m1.res_mii);
-  int raw_2 = std::max(m2.rec_mii, m2.res_mii);
-  int raw_fused = std::max(fused.rec_mii, fused.res_mii);
+  // and already reflected in resource_mii.
+  int raw_1 = std::max(m1.rec_mii, m1.resource_mii);
+  int raw_2 = std::max(m2.rec_mii, m2.resource_mii);
+  int raw_fused = std::max(fused.rec_mii, fused.resource_mii);
   int unfused_mii =
       is_producer_consumer ? (raw_1 + raw_2) : std::max(raw_1, raw_2);
   bool profitable = raw_fused <= unfused_mii;
 
   llvm::errs() << "[fuse-task] Profitability:"
-               << " m1(rec=" << m1.rec_mii << " res=" << m1.res_mii
+               << " m1(rec=" << m1.rec_mii << " resource=" << m1.resource_mii
                << " ops=" << m1.num_ops << " fan=" << m1.max_fanout
                << " mii=" << mii_1 << ")"
-               << " m2(rec=" << m2.rec_mii << " res=" << m2.res_mii
+               << " m2(rec=" << m2.rec_mii << " resource=" << m2.resource_mii
                << " ops=" << m2.num_ops << " fan=" << m2.max_fanout
                << " mii=" << mii_2 << ")"
-               << " fused(rec=" << fused.rec_mii << " res=" << fused.res_mii
-               << " ops=" << fused.num_ops << " fan=" << fused.max_fanout
-               << " mii=" << mii_fused << ")"
+               << " fused(rec=" << fused.rec_mii
+               << " resource=" << fused.resource_mii << " ops=" << fused.num_ops
+               << " fan=" << fused.max_fanout << " mii=" << mii_fused << ")"
                << " -> " << (profitable ? "PROFITABLE" : "REJECTED") << "\n";
   return profitable;
 }
@@ -1208,8 +1208,8 @@ struct ProducerConsumerTaskFusion : public OpRewritePattern<TaskflowTaskOp> {
       }
     }
     // Replaces consumer's write and value outputs.
-    for (auto [o, n] : llvm::zip(consumer.getDoneWrites(),
-                                 fused.getDoneWrites()))
+    for (auto [o, n] :
+         llvm::zip(consumer.getDoneWrites(), fused.getDoneWrites()))
       o.replaceAllUsesWith(n);
     for (auto [o, n] :
          llvm::zip(consumer.getValueOutputs(), fused.getValueOutputs()))
@@ -1248,8 +1248,7 @@ struct SiblingTaskFusion : public OpRewritePattern<TaskflowTaskOp> {
       Value orig_read = t1.getWillReads()[i];
       for (unsigned j = 0; j < fused.getWillReads().size(); ++j) {
         if (fused.getWillReads()[j] == orig_read) {
-          t1.getDoneReads()[i].replaceAllUsesWith(
-              fused.getDoneReads()[j]);
+          t1.getDoneReads()[i].replaceAllUsesWith(fused.getDoneReads()[j]);
           break;
         }
       }
@@ -1259,8 +1258,7 @@ struct SiblingTaskFusion : public OpRewritePattern<TaskflowTaskOp> {
       Value resolved = resolveThrough(orig_read, t1);
       for (unsigned j = 0; j < fused.getWillReads().size(); ++j) {
         if (fused.getWillReads()[j] == resolved) {
-          t2.getDoneReads()[i].replaceAllUsesWith(
-              fused.getDoneReads()[j]);
+          t2.getDoneReads()[i].replaceAllUsesWith(fused.getDoneReads()[j]);
           break;
         }
       }
@@ -1270,8 +1268,7 @@ struct SiblingTaskFusion : public OpRewritePattern<TaskflowTaskOp> {
     unsigned t1_wo = t1.getDoneWrites().size();
     unsigned t1_vo = t1.getValueOutputs().size();
     for (unsigned i = 0; i < t1_wo; ++i)
-      t1.getDoneWrites()[i].replaceAllUsesWith(
-          fused.getDoneWrites()[i]);
+      t1.getDoneWrites()[i].replaceAllUsesWith(fused.getDoneWrites()[i]);
     for (unsigned i = 0; i < t1_vo; ++i)
       t1.getValueOutputs()[i].replaceAllUsesWith(fused.getValueOutputs()[i]);
     for (unsigned i = 0; i < t2.getDoneWrites().size(); ++i)

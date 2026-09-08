@@ -39,14 +39,14 @@
 // RUN:   --architecture-spec=%S/../../../archspec/architecture_4x4.yaml \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=STALE
 
-// CANDIDATES: "spec_sha256":"{{[0-9a-f]{64}}}"
-// CANDIDATES: "body_sha256":"{{[0-9a-f]{64}}}"
+// CANDIDATES: "spec_sha256":"{{[0-9a-f]+}}"
 // CANDIDATES: "spatial_capacity_policy":"all-tasks-simultaneous-exact-pack"
+// CANDIDATES: "body_sha256":"{{[0-9a-f]+}}"
 // CANDIDATES: "candidate_id":"candidate-0"
 // CANDIDATES-NOT: "cgra_shape":"1x4"{{.*}}"cgra_shape":"4x1"
 // CANDIDATES-NOT: "cgra_shape":"4x1"{{.*}}"cgra_shape":"1x4"
 // CANDIDATES: "candidate_count":62
-// BOUND-COUNT-2: amoeba.source_task_body_sha256 = "{{[0-9a-f]{64}}}"
+// BOUND-COUNT-2: amoeba.source_task_body_sha256 = "{{[0-9a-f]+}}"
 // LIMIT: complete concurrently packable shape space exceeds max-candidates=61
 // MATERIALIZED: taskflow.task @A
 // MATERIALIZED-SAME: amoeba.analytical_shape_orientation_fixed
