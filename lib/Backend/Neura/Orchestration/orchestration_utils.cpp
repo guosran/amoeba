@@ -2,7 +2,9 @@
 
 #include "Backend/Neura/Orchestration/orchestration_utils.h"
 #include "TaskflowDialect/TaskflowOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -14,6 +16,8 @@
 #include <cassert>
 #include <climits>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +42,10 @@ std::string CgraShape::describe(int cgra_count) const {
   return s;
 }
 
+std::string formatRectangularCgraShape(int64_t rows, int64_t cols) {
+  return std::to_string(rows) + "x" + std::to_string(cols);
+}
+
 std::string CgraShape::irAttr() const {
   std::string s = std::to_string(rows) + "x" + std::to_string(cols);
   if (!is_rectangular && !cgra_positions.empty()) {
@@ -47,6 +55,22 @@ std::string CgraShape::irAttr() const {
     s += "]";
   }
   return s;
+}
+
+SmallVector<CgraShape> getRectangularShapes(int cgra_count, int grid_rows,
+                                            int grid_cols) {
+  SmallVector<CgraShape> shapes;
+  if (cgra_count <= 0 || grid_rows <= 0 || grid_cols <= 0)
+    return shapes;
+
+  for (int rows = 1; rows <= grid_rows; ++rows) {
+    if (cgra_count % rows != 0)
+      continue;
+    int cols = cgra_count / rows;
+    if (cols <= grid_cols)
+      shapes.push_back({rows, cols, true, {}});
+  }
+  return shapes;
 }
 
 // Internal helpers
@@ -82,38 +106,14 @@ SmallVector<CgraShape> getNonRectangularShapes(int cgra_count) {
 // getAllPlacementShapes
 
 SmallVector<CgraShape> getAllPlacementShapes(int cgra_count) {
-  SmallVector<CgraShape> shapes;
-
-  // 1. Rectangular shapes with both orientations, deduplicated.
-  {
-    llvm::DenseSet<int64_t> seen_keys; // encodes (rows<<16)|cols
-    for (int row_dim = 1; row_dim <= kCgraGridRows; ++row_dim) {
-      for (int col_dim = 1; col_dim <= kCgraGridCols; ++col_dim) {
-        if (row_dim * col_dim == cgra_count) {
-          int64_t key = ((int64_t)row_dim << 16) | col_dim;
-          if (seen_keys.insert(key).second) {
-            shapes.push_back({row_dim, col_dim, true, {}});
-            // Adds the rotated orientation if different (e.g. 1×4 -> 4×1).
-            if (row_dim != col_dim) {
-              int64_t rotated_key = ((int64_t)col_dim << 16) | row_dim;
-              if (seen_keys.insert(rotated_key).second) {
-                shapes.push_back({col_dim, row_dim, true, {}});
-              }
-            }
-          }
-        }
-      }
-    }
-    // Sorts rectangles: prefer more square-like (smaller |rows-cols|), then
-    // smaller bounding-box area as tiebreaker.
-    llvm::sort(shapes, [](const CgraShape &lhs, const CgraShape &rhs) {
-      int squareness_lhs = std::abs(lhs.rows - lhs.cols);
-      int squareness_rhs = std::abs(rhs.rows - rhs.cols);
-      if (squareness_lhs != squareness_rhs)
-        return squareness_lhs < squareness_rhs;
-      return lhs.area() < rhs.area();
-    });
-  }
+  SmallVector<CgraShape> shapes = getRectangularShapes(cgra_count);
+  llvm::sort(shapes, [](const CgraShape &lhs, const CgraShape &rhs) {
+    int squareness_lhs = std::abs(lhs.rows - lhs.cols);
+    int squareness_rhs = std::abs(rhs.rows - rhs.cols);
+    if (squareness_lhs != squareness_rhs)
+      return squareness_lhs < squareness_rhs;
+    return lhs.area() < rhs.area();
+  });
 
   // 2. Non-rectangular shapes with all four 90° rotations.
   auto base_non_rect = getNonRectangularShapes(cgra_count);
@@ -172,6 +172,138 @@ SmallVector<CgraShape> getAllPlacementShapes(int cgra_count) {
   }
 
   return shapes;
+}
+
+// Infers a static trip count from Taskflow counter chains. A constant counter
+// such as `0..10 step 3` contributes four iterations; nested counters multiply
+// their counts, while independent root chains use the maximum chain product.
+// The result has three states: a number for static counters, `std::nullopt`
+// when no Taskflow counter exists, and failure for dynamic, malformed, or
+// overflowing counters. Supporting dynamic bounds requires symbolic trip-count
+// analysis.
+FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
+                                                           std::string &error) {
+  SmallVector<TaskflowCounterOp> counters;
+  task.walk([&](TaskflowCounterOp counter) { counters.push_back(counter); });
+  if (counters.empty())
+    return std::optional<int64_t>{};
+  if (!task.getBody().hasOneBlock()) {
+    error = "task " + task.getTaskName().str() +
+            " has counters but does not contain exactly one block; static "
+            "analytical DSE does not support this form yet (TODO: support "
+            "symbolic counter regions)";
+    return failure();
+  }
+
+  SmallVector<TaskflowCounterOp> roots;
+  DenseMap<Value, SmallVector<TaskflowCounterOp>> children;
+  for (TaskflowCounterOp counter : counters) {
+    if (Value parent = counter.getParentIndex())
+      children[parent].push_back(counter);
+    else
+      roots.push_back(counter);
+  }
+  if (roots.empty()) {
+    error = "task " + task.getTaskName().str() +
+            " has counters but no root counter";
+    return failure();
+  }
+
+  auto constantIndex = [](Value value) -> FailureOr<int64_t> {
+    if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+      return constant.value();
+    return failure();
+  };
+  // TODO: Extends this analysis with symbolic bounds when analytical DSE gains
+  // a policy for comparing dynamic trip counts.
+  auto counterTripCount = [&](TaskflowCounterOp counter) -> FailureOr<int64_t> {
+    FailureOr<int64_t> lower = constantIndex(counter.getLowerBound());
+    FailureOr<int64_t> upper = constantIndex(counter.getUpperBound());
+    FailureOr<int64_t> step = constantIndex(counter.getStep());
+    if (failed(lower) || failed(upper) || failed(step))
+      return failure();
+    if (*step <= 0 || *upper <= *lower ||
+        (*lower < 0 && *upper > std::numeric_limits<int64_t>::max() + *lower))
+      return failure();
+    int64_t distance = *upper - *lower;
+    return 1 + (distance - 1) / *step;
+  };
+
+  int64_t total = 1;
+  DenseSet<Operation *> visited;
+  for (TaskflowCounterOp root : roots) {
+    int64_t chainProduct = 1;
+    SmallVector<TaskflowCounterOp> worklist{root};
+    while (!worklist.empty()) {
+      TaskflowCounterOp counter = worklist.pop_back_val();
+      if (!visited.insert(counter.getOperation()).second) {
+        error = "task " + task.getTaskName().str() +
+                " has a cyclic or multiply referenced counter chain";
+        return failure();
+      }
+      FailureOr<int64_t> count = counterTripCount(counter);
+      if (failed(count) ||
+          chainProduct > std::numeric_limits<int64_t>::max() / *count) {
+        error = "task " + task.getTaskName().str() +
+                " has dynamic, invalid, or overflowing counter bounds; "
+                "static analytical DSE does not support this form yet "
+                "(TODO: support symbolic counter bounds)";
+        return failure();
+      }
+      chainProduct *= *count;
+      auto found = children.find(counter.getCounterIndex());
+      if (found != children.end())
+        worklist.append(found->second.begin(), found->second.end());
+    }
+    total = std::max(total, chainProduct);
+  }
+  if (visited.size() != counters.size()) {
+    error = "task " + task.getTaskName().str() +
+            " has a counter disconnected from every root";
+    return failure();
+  }
+  return std::optional<int64_t>{total};
+}
+
+FailureOr<std::optional<int64_t>>
+resolveStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
+  if (auto tripCount = task->getAttrOfType<IntegerAttr>("trip_count")) {
+    if (tripCount.getInt() <= 0) {
+      error =
+          "task " + task.getTaskName().str() + " has non-positive trip_count";
+      return failure();
+    }
+    return std::optional<int64_t>{tripCount.getInt()};
+  }
+  return inferStaticTaskTripCount(task, error);
+}
+
+SmallVector<TaskflowTaskOp> collectTaskflowTasks(func::FuncOp func) {
+  SmallVector<TaskflowTaskOp> tasks;
+  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+  return tasks;
+}
+
+void setTaskResourceShape(TaskflowTaskOp task, int cgraCount,
+                          StringRef cgraShape) {
+  OpBuilder builder(task.getContext());
+  task->setAttr("cgra_count", builder.getI32IntegerAttr(cgraCount));
+  task->setAttr("cgra_shape", builder.getStringAttr(cgraShape));
+}
+
+int64_t encodeCgraLocation(int row, int col) {
+  return (static_cast<int64_t>(row) << 32) | static_cast<uint32_t>(col);
+}
+
+int getTaskTileGroup(TaskflowTaskOp task) {
+  if (auto group = task->getAttrOfType<IntegerAttr>("tile_group"))
+    return static_cast<int>(group.getInt());
+  return -1;
+}
+
+bool isParallelTaskTile(TaskflowTaskOp task) {
+  auto parallel = task->getAttrOfType<BoolAttr>("tile_parallel");
+  return !parallel || parallel.getValue();
 }
 
 // canAllTasksFitOnGrid
@@ -392,11 +524,11 @@ public:
   void build(func::FuncOp func) {
     // Phase 1: Creates a TaskNode for every TaskflowTaskOp in the function.
     size_t task_id = 0;
-    func.walk([&](TaskflowTaskOp task) {
+    for (TaskflowTaskOp task : collectTaskflowTasks(func)) {
       auto node = std::make_unique<TaskNode>(task_id++, task);
       op_to_node[task] = node.get();
       task_nodes.push_back(std::move(node));
-    });
+    }
 
     // Phase 2: Creates MemoryNodes using ORIGINAL memrefs (canonical identity).
     // Uses original_read_memrefs / original_write_memrefs so that aliased
@@ -462,6 +594,183 @@ private:
     }
   }
 };
+
+// TaskPipelineIntervalAnalyzer
+
+TaskPipelineIntervalAnalyzer::TaskPipelineIntervalAnalyzer(
+    ArrayRef<TaskScheduleResult> schedule_result)
+    : schedule_result_(schedule_result) {}
+
+TaskPipelineIntervalResult TaskPipelineIntervalAnalyzer::analyze() {
+  TaskPipelineIntervalResult result;
+  if (schedule_result_.empty()) {
+    return result;
+  }
+
+  buildTaskIndex();
+  task_graph_.resize(schedule_result_.size());
+  buildDataDependenceEdges();
+  buildCgraExecutionOrderEdgesAndPipelineCycles();
+  return computeLongestPipelineCycle();
+}
+
+int64_t TaskPipelineIntervalAnalyzer::getTaskDuration(int task_idx) const {
+  return std::max<int64_t>(1, schedule_result_[task_idx].duration);
+}
+
+void TaskPipelineIntervalAnalyzer::addExecutionOrderEdge(int task_idx,
+                                                         int next_task_idx) {
+  if (task_idx < 0 || next_task_idx < 0 || task_idx == next_task_idx) {
+    return;
+  }
+  task_graph_[task_idx].push_back({next_task_idx, getTaskDuration(task_idx)});
+}
+
+void TaskPipelineIntervalAnalyzer::buildTaskIndex() {
+  for (auto [idx, task_result] : llvm::enumerate(schedule_result_)) {
+    TaskflowTaskOp task = task_result.task;
+    task_to_index_[task.getOperation()] = static_cast<int>(idx);
+  }
+}
+
+void TaskPipelineIntervalAnalyzer::buildDataDependenceEdges() {
+  for (auto [task_idx, task_result] : llvm::enumerate(schedule_result_)) {
+    for (TaskflowTaskOp pred : task_result.predecessor_tasks) {
+      auto pred_it = task_to_index_.find(pred.getOperation());
+      if (pred_it == task_to_index_.end()) {
+        continue;
+      }
+      addExecutionOrderEdge(pred_it->second, static_cast<int>(task_idx));
+    }
+  }
+}
+
+void TaskPipelineIntervalAnalyzer::
+    buildCgraExecutionOrderEdgesAndPipelineCycles() {
+  DenseMap<int64_t, SmallVector<int>> cgra_location_to_tasks;
+  for (auto [idx, task_result] : llvm::enumerate(schedule_result_)) {
+    for (const TaskScheduleResult::CgraOccupancy &occupancy :
+         task_result.cgra_occupancies) {
+      cgra_location_to_tasks[taskflow::encodeCgraLocation(occupancy.row,
+                                                          occupancy.col)]
+          .push_back(static_cast<int>(idx));
+    }
+  }
+
+  for (auto &entry : cgra_location_to_tasks) {
+    SmallVector<int> &tasks = entry.second;
+    llvm::sort(tasks, [&](int lhs, int rhs) {
+      const TaskScheduleResult &lhs_result = schedule_result_[lhs];
+      const TaskScheduleResult &rhs_result = schedule_result_[rhs];
+      if (lhs_result.start_time != rhs_result.start_time) {
+        return lhs_result.start_time < rhs_result.start_time;
+      }
+      return lhs < rhs;
+    });
+
+    for (size_t i = 1; i < tasks.size(); ++i) {
+      addExecutionOrderEdge(tasks[i - 1], tasks[i]);
+    }
+
+    int first_task_idx = tasks.front();
+    int last_task_idx = tasks.back();
+    cgra_pipeline_cycles_.push_back(
+        {last_task_idx, first_task_idx, getTaskDuration(last_task_idx)});
+  }
+}
+
+TaskPipelineIntervalAnalyzer::LongestExecutionPath
+TaskPipelineIntervalAnalyzer::findLongestPathToTarget(
+    int current_task_idx, int target_task_idx, DenseSet<int> &visiting,
+    DenseMap<int, LongestExecutionPath> &memo) const {
+  if (current_task_idx == target_task_idx) {
+    LongestExecutionPath result;
+    result.found = true;
+    result.path.push_back(current_task_idx);
+    return result;
+  }
+
+  if (visiting.contains(current_task_idx)) {
+    return LongestExecutionPath();
+  }
+
+  // Memoised on `current` for a fixed `target`. The plain recursion re-walks
+  // every path through every diamond, which is exponential in the graph: once
+  // the resource pass partitions a program into ~100 tasks with fan-out, this
+  // analysis stops terminating (axpy_20 ran past 400s where placement itself
+  // took 0.07s). `computeStartTimes` has already rejected any cycle by the time
+  // this runs, so on a DAG the memo is exact, not an approximation.
+  auto memo_it = memo.find(current_task_idx);
+  if (memo_it != memo.end()) {
+    return memo_it->second;
+  }
+
+  visiting.insert(current_task_idx);
+  LongestExecutionPath best;
+  for (const ExecutionOrderEdge &edge : task_graph_[current_task_idx]) {
+    LongestExecutionPath suffix = findLongestPathToTarget(
+        edge.next_task_idx, target_task_idx, visiting, memo);
+    if (!suffix.found) {
+      continue;
+    }
+
+    // int64_t, not int: `edge.latency` and `suffix.total_latency` are both
+    // int64_t because a GPT-2 prefill block measures 1.85e9 cycles on one task.
+    // Two such hops sum past INT32_MAX and wrap negative, at which point the
+    // comparison below picks the SHORTER branch and the interval this analysis
+    // publishes is a fraction of the truth.
+    int64_t total_latency = edge.latency + suffix.total_latency;
+    if (!best.found || total_latency > best.total_latency) {
+      best.found = true;
+      best.total_latency = total_latency;
+      best.path.clear();
+      best.path.push_back(current_task_idx);
+      best.path.append(suffix.path.begin(), suffix.path.end());
+    }
+  }
+  visiting.erase(current_task_idx);
+  memo[current_task_idx] = best;
+  return best;
+}
+
+TaskPipelineIntervalResult
+TaskPipelineIntervalAnalyzer::computeLongestPipelineCycle() const {
+  TaskPipelineIntervalResult result;
+  for (const CgraPipelineCycle &pipeline_cycle : cgra_pipeline_cycles_) {
+    DenseSet<int> visiting;
+    // One memo per target: the value cached is "longest path from `current` to
+    // THIS cycle's last task", so it cannot be shared across cycles.
+    DenseMap<int, LongestExecutionPath> memo;
+    LongestExecutionPath path =
+        findLongestPathToTarget(pipeline_cycle.first_task_idx,
+                                pipeline_cycle.last_task_idx, visiting, memo);
+    if (!path.found) {
+      continue;
+    }
+
+    int64_t interval = path.total_latency + pipeline_cycle.latency;
+    if (interval <= result.pipeline_interval) {
+      continue;
+    }
+
+    result.pipeline_interval = interval;
+    result.critical_path.clear();
+
+    int bottleneck_idx = pipeline_cycle.last_task_idx;
+    int64_t bottleneck_duration = getTaskDuration(bottleneck_idx);
+    for (int idx : path.path) {
+      const TaskScheduleResult &task_result = schedule_result_[idx];
+      result.critical_path.push_back(task_result.task);
+      int64_t duration = getTaskDuration(idx);
+      if (duration > bottleneck_duration) {
+        bottleneck_idx = idx;
+        bottleneck_duration = duration;
+      }
+    }
+    result.bottleneck_task = schedule_result_[bottleneck_idx].task;
+  }
+  return result;
+}
 
 // TaskScheduler
 // Orchestrates a task-memory graph onto a 2D multi-CGRA grid using the

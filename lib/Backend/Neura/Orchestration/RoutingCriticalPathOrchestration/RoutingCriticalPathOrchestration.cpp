@@ -50,8 +50,7 @@ int RoutingCriticalPathOrchestration::computeDependencyDepth(
 TaskPriorityMap
 RoutingCriticalPathOrchestration::computeRoutingCriticalPathPriority(
     func::FuncOp func) const {
-  SmallVector<TaskflowTaskOp> tasks;
-  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+  SmallVector<TaskflowTaskOp> tasks = collectTaskflowTasks(func);
 
   TaskSuccessorMap successors;
   for (TaskflowTaskOp task : tasks) {

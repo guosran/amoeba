@@ -48,6 +48,11 @@
 // RUN: -o %t.dataflow.mlir
 // RUN: FileCheck %s --input-file=%t.dataflow.mlir --check-prefixes=DATAFLOW
 
+// RUN: mlir-amoeba-opt %t.dataflow.mlir \
+// RUN: '--analyze-rec-res-mii=x-tiles=4 y-tiles=4' \
+// RUN: --architecture-spec=%S/../../../archspec/architecture.yaml \
+// RUN: | FileCheck %s --check-prefix=ANALYTICAL-BOUNDS
+
 // RUN: mlir-amoeba-opt %s --convert-affine-to-taskflow \
 // RUN: --construct-hyperblock-from-task \
 // RUN: --classify-task-and-counter \
@@ -74,6 +79,8 @@
 // RUN: FileCheck %s --input-file=%t.mapped.mlir --check-prefixes=MAPPED
 
 
+
+// ANALYTICAL-BOUNDS: module attributes {amoeba.rec_mii = 2 : i32, amoeba.rec_res_mii_info, amoeba.res_mii = 1 : i32}
 
 module attributes {} {
   func.func @_Z6kernelPiS_S_(%arg0: memref<?xi32>, %arg1: memref<?xi32>, %arg2: memref<?xi32>) -> i32 attributes {llvm.linkage = #llvm.linkage<external>} {

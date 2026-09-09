@@ -62,6 +62,40 @@ def OrchestrateTasksOnAccelerators
       "::mlir::amoeba::neura::createOrchestrateTasksOnAcceleratorsPass()";
 }
 
+def AnalyzeTaskPipelineInterval
+    : Pass<"analyze-task-pipeline-interval", "func::FuncOp"> {
+  let summary =
+      "Analyze the pipeline interval of already-profiled and scheduled tasks";
+  let description = [{
+    Reads taskflow.task operations that contain profile_info.duration and
+    task_orchestration_info.cgra_positions, reconstructs the concrete per-CGRA
+    context order, and emits task_pipeline_interval_info on the parent func.func.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createAnalyzeTaskPipelineIntervalPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def AnalyzeRecResMii : Pass<"analyze-rec-res-mii", "ModuleOp"> {
+  let summary = "Compute mapper-compatible RecMII and ResMII without mapping";
+  let description = [{
+    Computes the recurrence and resource lower bounds already used by Neura's
+    heuristic mapper for exactly one standalone task DFG. x-tiles and y-tiles
+    select the concrete mapper rectangle. The result is written as the
+    amoeba.rec_mii and amoeba.res_mii module attributes for the ML feature
+    adapter; this pass never places or routes an operation and therefore does
+    not perform a real mapper run.
+  }];
+  let options = [Option<"xTiles", "x-tiles", "int64_t", /*default=*/"0",
+                        "Concrete mapper tile columns; must be positive.">,
+                 Option<"yTiles", "y-tiles", "int64_t", /*default=*/"0",
+                        "Concrete mapper tile rows; must be positive.">];
+  let constructor = "::mlir::amoeba::neura::createAnalyzeRecResMiiPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::neura::NeuraDialect"];
+}
+
 def FuseTask : Pass<"fuse-task", "func::FuncOp"> {
   let summary = "Fuse Taskflow tasks using Neura profitability metrics";
   let description = [{
