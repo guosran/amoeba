@@ -34,9 +34,12 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <limits>
+#include <optional>
 #include <set>
 
 using namespace mlir;
@@ -165,7 +168,13 @@ struct TaskGraphNode {
 
   // Returns estimated task latency using the pipelined execution model:
   //   latency = II * (trip_count - 1) + steps.
-  int64_t estimatedLatency() const { return ii * (trip_count - 1) + steps; }
+  int64_t estimatedLatency() const {
+    if (trip_count == 0)
+      return 0;
+    std::optional<int64_t> latency =
+        llvm::checkedMulAdd<int64_t>(ii, trip_count - 1, steps);
+    return latency.value_or(std::numeric_limits<int64_t>::max());
+  }
 };
 
 class TaskDependencyGraph {

@@ -10,6 +10,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -222,14 +223,16 @@ FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
     FailureOr<int64_t> step = constantIndex(counter.getStep());
     if (failed(lower) || failed(upper) || failed(step))
       return failure();
-    if (*step <= 0 || *upper <= *lower ||
+    if (*step <= 0 ||
         (*lower < 0 && *upper > std::numeric_limits<int64_t>::max() + *lower))
       return failure();
+    if (*upper <= *lower)
+      return 0;
     int64_t distance = *upper - *lower;
     return 1 + (distance - 1) / *step;
   };
 
-  int64_t total = 1;
+  int64_t total = 0;
   DenseSet<Operation *> visited;
   for (TaskflowCounterOp root : roots) {
     int64_t chainProduct = 1;
@@ -243,7 +246,8 @@ FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
       }
       FailureOr<int64_t> count = counterTripCount(counter);
       if (failed(count) ||
-          chainProduct > std::numeric_limits<int64_t>::max() / *count) {
+          (*count != 0 &&
+           chainProduct > std::numeric_limits<int64_t>::max() / *count)) {
         error = "task " + task.getTaskName().str() +
                 " has dynamic, invalid, or overflowing counter bounds; "
                 "static analytical DSE does not support this form yet "
@@ -268,14 +272,57 @@ FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
 FailureOr<std::optional<int64_t>>
 resolveStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
   if (auto tripCount = task->getAttrOfType<IntegerAttr>("trip_count")) {
-    if (tripCount.getInt() <= 0) {
-      error =
-          "task " + task.getTaskName().str() + " has non-positive trip_count";
+    if (tripCount.getInt() < 0) {
+      error = "task " + task.getTaskName().str() + " has negative trip_count";
       return failure();
     }
     return std::optional<int64_t>{tripCount.getInt()};
   }
   return inferStaticTaskTripCount(task, error);
+}
+
+FailureOr<std::optional<int64_t>>
+resolveTaskExecutionDuration(TaskflowTaskOp task, std::string &error) {
+  if (auto estLatency = task->getAttrOfType<IntegerAttr>("est_latency")) {
+    int64_t cycles = estLatency.getInt();
+    if (cycles > 0)
+      return std::optional<int64_t>{cycles};
+  }
+
+  auto ii = task->getAttrOfType<IntegerAttr>("compiled_ii");
+  auto tripCount = task->getAttrOfType<IntegerAttr>("trip_count");
+  auto profileInfo = task->getAttrOfType<DictionaryAttr>("profile_info");
+  if (!profileInfo) {
+    if (ii && tripCount && ii.getInt() > 0 && tripCount.getInt() > 0) {
+      error = "task " + task.getTaskName().str() +
+              " requires profile_info.duration to derive its execution "
+              "duration from compiled_ii and trip_count";
+      return failure();
+    }
+    return std::optional<int64_t>{};
+  }
+
+  auto duration = dyn_cast_or_null<IntegerAttr>(profileInfo.get("duration"));
+  if (!duration) {
+    error = "task " + task.getTaskName().str() +
+            " has profile_info without an integer duration";
+    return failure();
+  }
+
+  int64_t steps = duration.getInt();
+  if (ii && tripCount && ii.getInt() > 0 && tripCount.getInt() > 0 &&
+      steps > 0) {
+    std::optional<int64_t> cycles = llvm::checkedMulAdd<int64_t>(
+        ii.getInt(), tripCount.getInt() - 1, steps);
+    if (!cycles) {
+      error = "task " + task.getTaskName().str() +
+              " execution duration exceeds the signed 64-bit cycle range";
+      return failure();
+    }
+    return std::optional<int64_t>{*cycles};
+  }
+
+  return std::optional<int64_t>{std::max<int64_t>(1, steps)};
 }
 
 SmallVector<TaskflowTaskOp> collectTaskflowTasks(func::FuncOp func) {
@@ -412,9 +459,9 @@ bool canAllTasksFitOnGrid(ArrayRef<int> task_cgra_counts) {
 struct CgraPosition {
   int row;
   int col;
-  int start_time = 0; // Internal scheduling; not emitted to IR.
-  int duration = 1;   // Read from profile_info; not emitted to IR.
-  int context_id = 0; // Emitted to IR as task_orchestration_info.
+  int64_t start_time = 0; // Internal scheduling; not emitted to IR.
+  int64_t duration = 1;   // Whole task latency; not emitted to IR.
+  int context_id = 0;     // Emitted to IR as task_orchestration_info.
 
   bool operator==(const CgraPosition &other) const {
     return row == other.row && col == other.col;
@@ -482,22 +529,21 @@ struct TaskNode {
 
   // Placement result.
   SmallVector<CgraPosition> placement;
+  int64_t duration = 1;
 
   TaskNode(size_t id, TaskflowTaskOp op) : id(id), op(op) {}
 
-  // Returns the task's execution duration in time slots.
-  //
-  // Reads from profile_info.duration if present (written by
-  // ResourceAwareTaskOptimizationPass after profiling).
-  // Defaults to 1 when no profiling data is available.
-  int getDuration() const {
-    if (auto profile = op->getAttrOfType<DictionaryAttr>("profile_info")) {
-      if (auto dur = dyn_cast_or_null<IntegerAttr>(profile.get("duration"))) {
-        return std::max(1, static_cast<int>(dur.getInt()));
-      }
-    }
-    return 1;
+  LogicalResult resolveDuration() {
+    std::string error;
+    FailureOr<std::optional<int64_t>> resolved =
+        resolveTaskExecutionDuration(op, error);
+    if (failed(resolved))
+      return op.emitOpError() << error;
+    duration = resolved->value_or(1);
+    return success();
   }
+
+  int64_t getDuration() const { return duration; }
 };
 
 // Represents a MemRef node in the dependency graph.
@@ -601,17 +647,24 @@ TaskPipelineIntervalAnalyzer::TaskPipelineIntervalAnalyzer(
     ArrayRef<TaskScheduleResult> schedule_result)
     : schedule_result_(schedule_result) {}
 
-TaskPipelineIntervalResult TaskPipelineIntervalAnalyzer::analyze() {
+FailureOr<TaskPipelineIntervalResult>
+TaskPipelineIntervalAnalyzer::analyze(std::string &error) {
   TaskPipelineIntervalResult result;
   if (schedule_result_.empty()) {
     return result;
   }
 
+  arithmetic_overflow_ = false;
   buildTaskIndex();
   task_graph_.resize(schedule_result_.size());
   buildDataDependenceEdges();
   buildCgraExecutionOrderEdgesAndPipelineCycles();
-  return computeLongestPipelineCycle();
+  result = computeLongestPipelineCycle();
+  if (arithmetic_overflow_) {
+    error = "pipeline interval exceeds the signed 64-bit cycle range";
+    return failure();
+  }
+  return result;
 }
 
 int64_t TaskPipelineIntervalAnalyzer::getTaskDuration(int task_idx) const {
@@ -719,10 +772,15 @@ TaskPipelineIntervalAnalyzer::findLongestPathToTarget(
     // Two such hops sum past INT32_MAX and wrap negative, at which point the
     // comparison below picks the SHORTER branch and the interval this analysis
     // publishes is a fraction of the truth.
-    int64_t total_latency = edge.latency + suffix.total_latency;
-    if (!best.found || total_latency > best.total_latency) {
+    std::optional<int64_t> total_latency =
+        llvm::checkedAdd<int64_t>(edge.latency, suffix.total_latency);
+    if (!total_latency) {
+      arithmetic_overflow_ = true;
+      continue;
+    }
+    if (!best.found || *total_latency > best.total_latency) {
       best.found = true;
-      best.total_latency = total_latency;
+      best.total_latency = *total_latency;
       best.path.clear();
       best.path.push_back(current_task_idx);
       best.path.append(suffix.path.begin(), suffix.path.end());
@@ -748,12 +806,17 @@ TaskPipelineIntervalAnalyzer::computeLongestPipelineCycle() const {
       continue;
     }
 
-    int64_t interval = path.total_latency + pipeline_cycle.latency;
-    if (interval <= result.pipeline_interval) {
+    std::optional<int64_t> interval =
+        llvm::checkedAdd<int64_t>(path.total_latency, pipeline_cycle.latency);
+    if (!interval) {
+      arithmetic_overflow_ = true;
+      continue;
+    }
+    if (*interval <= result.pipeline_interval) {
       continue;
     }
 
-    result.pipeline_interval = interval;
+    result.pipeline_interval = *interval;
     result.critical_path.clear();
 
     int bottleneck_idx = pipeline_cycle.last_task_idx;
@@ -813,6 +876,14 @@ bool TaskScheduler::schedule(func::FuncOp func,
     return true;
   }
 
+  // Resolve whole-task residency once before placement. The post-schedule
+  // interval analysis uses the same helper, so context order and interval are
+  // expressed in the same cycle unit.
+  for (auto &task_node : graph.task_nodes) {
+    if (failed(task_node->resolveDuration()))
+      return false;
+  }
+
   // Sorts tasks by orchestration-provided priority. The scheduler does not
   // infer a critical path; orchestration algorithms provide that policy.
   SmallVector<TaskNode *> sorted_tasks;
@@ -839,12 +910,6 @@ bool TaskScheduler::schedule(func::FuncOp func,
   // by SSA proximity.
   constexpr int kMaxIterations = 10;
 
-  // Stores the total number of tasks so findBestPlacement can compute a
-  // sufficient time horizon even on very small grids where the multi-CGRA
-  // grid area (grid_rows_ * grid_cols_) is much smaller than task_count
-  // (e.g. 5 tasks on a 1x1 grid).
-  total_task_count_ = static_cast<int>(sorted_tasks.size());
-
   for (int iter = 0; iter < kMaxIterations; ++iter) {
     if (iter > 0) {
       resetTaskPlacements(graph);
@@ -859,10 +924,11 @@ bool TaskScheduler::schedule(func::FuncOp func,
 
       TaskPlacement placement = findBestPlacement(task_node, cgra_count, graph);
 
-      assert(!placement.cgra_positions.empty() &&
-             "findBestPlacement must succeed: cgra_count should be "
-             "validated by the upstream resource-aware optimization pass "
-             "or manually assigned resource binding attributes");
+      if (placement.cgra_positions.empty()) {
+        task_node->op.emitOpError()
+            << "cannot find a legal placement for cgra_count=" << cgra_count;
+        return false;
+      }
 
       for (const auto &pos : placement.cgra_positions) {
         task_node->placement.push_back(pos);
@@ -886,7 +952,7 @@ bool TaskScheduler::schedule(func::FuncOp func,
   // For every physical CGRA (row, col), sort all tasks assigned to it by
   // their internal start_time, then assign context_id = 0, 1, 2, ...
   // This maps directly to the hardware context-memory index.
-  using TaskInterval = std::pair<int, TaskNode *>; // (start_time, node)
+  using TaskInterval = std::pair<int64_t, TaskNode *>; // (start_time, node)
   std::vector<std::vector<SmallVector<TaskInterval, 4>>> cell_tasks(
       grid_rows_, std::vector<SmallVector<TaskInterval, 4>>(grid_cols_));
 
@@ -993,9 +1059,14 @@ bool TaskScheduler::schedule(func::FuncOp func,
     // downstream passes can read the task duration without re-computing it.
     if (!task_node->op->hasAttr("profile_info")) {
       SmallVector<NamedAttribute, 1> profile_attrs;
+      int64_t duration = task_node->getDuration();
+      if (duration > INT32_MAX)
+        task_node->op.emitWarning() << "profile_info.duration " << duration
+                                    << " exceeds i32 and is clamped";
       profile_attrs.push_back(
           NamedAttribute(StringAttr::get(func.getContext(), "duration"),
-                         builder.getI32IntegerAttr(task_node->getDuration())));
+                         builder.getI32IntegerAttr(static_cast<int32_t>(
+                             std::min<int64_t>(duration, INT32_MAX)))));
       task_node->op->setAttr(
           "profile_info",
           DictionaryAttr::get(func.getContext(), profile_attrs));
@@ -1018,22 +1089,29 @@ bool TaskScheduler::posInBounds(const CgraPosition &pos) const {
 //
 // Spatial mode: occupied once any task is assigned (permanently taken).
 // SpatialTemporal mode: occupied if any existing interval overlaps.
-bool TaskScheduler::isOccupied(int row, int col, int start_time,
-                               int duration) const {
+bool TaskScheduler::isOccupied(int row, int col, int64_t start_time,
+                               int64_t duration) const {
   if (mode_ == SchedulingMode::Spatial) {
     return !cgra_occupancy_[row][col].empty();
   }
+  std::optional<int64_t> end_time =
+      llvm::checkedAdd<int64_t>(start_time, duration);
+  if (!end_time)
+    return true;
   for (auto [occupied_start, occupied_end] : cgra_occupancy_[row][col]) {
-    if (start_time < occupied_end && start_time + duration > occupied_start) {
+    if (start_time < occupied_end && *end_time > occupied_start) {
       return true;
     }
   }
   return false;
 }
 
-void TaskScheduler::markOccupied(int row, int col, int start_time,
-                                 int duration) {
-  cgra_occupancy_[row][col].push_back({start_time, start_time + duration});
+void TaskScheduler::markOccupied(int row, int col, int64_t start_time,
+                                 int64_t duration) {
+  std::optional<int64_t> end_time =
+      llvm::checkedAdd<int64_t>(start_time, duration);
+  assert(end_time && "placement interval must fit in signed 64-bit cycles");
+  cgra_occupancy_[row][col].push_back({start_time, *end_time});
 }
 
 void TaskScheduler::resetTaskPlacements(TaskMemoryGraph &graph) {
@@ -1049,13 +1127,17 @@ void TaskScheduler::resetTaskPlacements(TaskMemoryGraph &graph) {
 
 // Computes the earliest feasible start time for `task_node` such that all
 // explicit taskflow dependencies have completed.
-int TaskScheduler::computeEarliestStartTime(const TaskNode *task_node) const {
-  int min_time = 0;
+int64_t
+TaskScheduler::computeEarliestStartTime(const TaskNode *task_node) const {
+  int64_t min_time = 0;
 
   auto updateFromPlacement = [&](const TaskNode *other) {
     if (other != task_node && !other->placement.empty()) {
       const CgraPosition &pos = other->placement[0];
-      min_time = std::max(min_time, pos.start_time + pos.duration);
+      std::optional<int64_t> end_time =
+          llvm::checkedAdd<int64_t>(pos.start_time, pos.duration);
+      assert(end_time && "placed interval must fit in signed 64-bit cycles");
+      min_time = std::max(min_time, *end_time);
     }
   };
 
@@ -1103,9 +1185,8 @@ bool TaskScheduler::assignAllSrams(TaskMemoryGraph &graph) {
 
 // Finds the best placement for `task_node` on the 2D multi-CGRA grid.
 //
-// In SpatialTemporal mode an outer time loop applies ASAP scheduling:
-// the earliest feasible start time is computed from dependency constraints,
-// then incremented by task_duration until a valid grid position is found.
+// In SpatialTemporal mode, tries the earliest dependency-ready instant and
+// every later instant at which an occupied cell becomes free.
 TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
                                                int cgra_count,
                                                TaskMemoryGraph &graph) {
@@ -1121,22 +1202,23 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
     shapes_to_try = getAllPlacementShapes(cgra_count);
   }
 
-  int task_duration = task_node->getDuration();
+  int64_t task_duration = task_node->getDuration();
+  int64_t t_start = (mode_ == SchedulingMode::SpatialTemporal)
+                        ? computeEarliestStartTime(task_node)
+                        : 0;
 
-  int t_start = (mode_ == SchedulingMode::SpatialTemporal)
-                    ? computeEarliestStartTime(task_node)
-                    : 0;
-  // Time horizon: at minimum every task gets one sequential slot per cell.
-  // grid_area is the number of CGRA cells in the multi-CGRA grid.
-  // For large grids task_count << grid_area, grid_area is enough.
-  // For small grids (e.g. 1x1 with 5 tasks) task_count dominates.
-  int grid_area = grid_rows_ * grid_cols_;
-  int max_time_slots = std::max(grid_area, total_task_count_);
-  int t_max = (mode_ == SchedulingMode::SpatialTemporal)
-                  ? t_start + max_time_slots * task_duration
-                  : 0;
+  SmallVector<int64_t> candidate_times{t_start};
+  if (mode_ == SchedulingMode::SpatialTemporal) {
+    for (const auto &row : cgra_occupancy_)
+      for (const auto &cell : row)
+        for (const auto &interval : cell)
+          if (interval.second > t_start)
+            candidate_times.push_back(interval.second);
+    llvm::sort(candidate_times);
+    candidate_times.erase(llvm::unique(candidate_times), candidate_times.end());
+  }
 
-  for (int t = t_start; t <= t_max; t += task_duration) {
+  for (int64_t t : candidate_times) {
     int best_score = INT_MIN;
     TaskPlacement best_at_t;
 
@@ -1183,10 +1265,6 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
 
     if (!best_at_t.cgra_positions.empty()) {
       return best_at_t;
-    }
-
-    if (mode_ == SchedulingMode::Spatial) {
-      break;
     }
   }
 

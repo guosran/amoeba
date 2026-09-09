@@ -11,6 +11,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,58 +22,16 @@ using namespace mlir::taskflow;
 
 namespace {
 
-static int64_t getRequiredTaskDuration(TaskflowTaskOp task) {
-  // Prefer `est_latency` = II*(trip_count-1) + steps when the resource-aware
-  // pass published it. It is the same quantity TaskScheduler charged for
-  // residency when it built this placement; analysing the placement with
-  // `profile_info.duration` (the DFG depth) instead would measure a different
-  // schedule from the one that was actually produced.
-  if (auto est_latency_attr = task->getAttrOfType<IntegerAttr>("est_latency")) {
-    int64_t est_latency_cycles = est_latency_attr.getInt();
-    if (est_latency_cycles > 0)
-      return est_latency_cycles;
-  }
-  auto profile_info = task->getAttrOfType<DictionaryAttr>("profile_info");
-  if (!profile_info) {
-    task.emitOpError() << "requires profile_info.duration";
-    return -1;
-  }
-
-  auto duration = dyn_cast_or_null<IntegerAttr>(profile_info.get("duration"));
-  if (!duration) {
-    task.emitOpError() << "requires profile_info.duration";
-    return -1;
-  }
-
-  // Derive the cycle count when `est_latency` is absent but its ingredients are
-  // not. An allocator that does not publish the product still publishes
-  // `compiled_ii` and `trip_count`, and `duration` is the `steps` term:
-  //
-  //   est_latency = compiled_ii * (trip_count - 1) + duration
-  //
-  // Without this the instrument silently changes units with the allocator that
-  // produced the IR. On `gemm`, main's output measures 5 -- a count of DFG
-  // levels -- against 262148 cycles for the identical schedule from an
-  // allocator that publishes `est_latency`, and 5 against 262148 reads as a
-  // 52000x difference rather than as two different quantities.
-  //
-  // What it buys: a baseline can be measured without being modified. The only
-  // reason `apply-decisions` was ever handed to a baseline arm was to make it
-  // publish `est_latency`, and that option does not exist on main -- main's
-  // resource-aware pass has exactly two, `balance-skip-mapper` and
-  // `estimation-mode`. The measurement no longer needs the measured party's
-  // cooperation.
-  auto ii_attr = task->getAttrOfType<IntegerAttr>("compiled_ii");
-  auto trip_attr = task->getAttrOfType<IntegerAttr>("trip_count");
-  if (ii_attr && trip_attr) {
-    const int64_t ii = ii_attr.getInt();
-    const int64_t trip = trip_attr.getInt();
-    const int64_t steps = duration.getInt();
-    if (ii > 0 && trip > 0 && steps > 0)
-      return std::max<int64_t>(1, ii * (trip - 1) + steps);
-  }
-
-  return std::max<int64_t>(1, duration.getInt());
+static FailureOr<int64_t> getRequiredTaskDuration(TaskflowTaskOp task) {
+  std::string error;
+  FailureOr<std::optional<int64_t>> duration =
+      resolveTaskExecutionDuration(task, error);
+  if (failed(duration))
+    return task.emitOpError() << error;
+  if (!*duration)
+    return task.emitOpError() << "requires est_latency or "
+                                 "profile_info.duration";
+  return **duration;
 }
 
 static std::optional<TaskScheduleResult::CgraOccupancy>
@@ -141,7 +100,9 @@ public:
     if (failed(computeStartTimes())) {
       return failure();
     }
-    updateScheduleTimes();
+    if (failed(updateScheduleTimes())) {
+      return failure();
+    }
     return schedule_result_;
   }
 
@@ -155,22 +116,22 @@ private:
 
   LogicalResult buildScheduleResults() {
     for (TaskflowTaskOp task : tasks_) {
-      int64_t duration = getRequiredTaskDuration(task);
-      if (duration < 0) {
+      FailureOr<int64_t> duration = getRequiredTaskDuration(task);
+      if (failed(duration)) {
         return failure();
       }
 
       TaskScheduleResult task_result;
       task_result.task = task;
-      task_result.duration = duration;
-      task_result.end_time = duration;
+      task_result.duration = *duration;
+      task_result.end_time = *duration;
       if (failed(readTaskCgraOccupancies(task, task_result.cgra_occupancies))) {
         return failure();
       }
 
       for (TaskScheduleResult::CgraOccupancy &occupancy :
            task_result.cgra_occupancies) {
-        occupancy.duration = duration;
+        occupancy.duration = *duration;
       }
 
       schedule_result_.push_back(std::move(task_result));
@@ -312,9 +273,13 @@ private:
       ++processed_tasks;
 
       for (int next_task : successors_[task]) {
-        int64_t next_start =
-            start_times_[task] + schedule_result_[task].duration;
-        start_times_[next_task] = std::max(start_times_[next_task], next_start);
+        std::optional<int64_t> next_start = llvm::checkedAdd<int64_t>(
+            start_times_[task], schedule_result_[task].duration);
+        if (!next_start)
+          return func_.emitError()
+                 << "task schedule exceeds the signed 64-bit cycle range";
+        start_times_[next_task] =
+            std::max(start_times_[next_task], *next_start);
 
         --predecessor_count_[next_task];
         if (predecessor_count_[next_task] == 0) {
@@ -331,17 +296,23 @@ private:
     return success();
   }
 
-  void updateScheduleTimes() {
+  LogicalResult updateScheduleTimes() {
     for (auto [task_idx, task_result] : llvm::enumerate(schedule_result_)) {
       int64_t start_time = start_times_[task_idx];
+      std::optional<int64_t> end_time =
+          llvm::checkedAdd<int64_t>(start_time, task_result.duration);
+      if (!end_time)
+        return func_.emitError()
+               << "task schedule exceeds the signed 64-bit cycle range";
       task_result.start_time = start_time;
-      task_result.end_time = start_time + task_result.duration;
+      task_result.end_time = *end_time;
       for (TaskScheduleResult::CgraOccupancy &occupancy :
            task_result.cgra_occupancies) {
         occupancy.start_time = start_time;
         occupancy.duration = task_result.duration;
       }
     }
+    return success();
   }
 
   func::FuncOp func_;
@@ -423,9 +394,15 @@ struct AnalyzeTaskPipelineIntervalPass
       return;
     }
 
-    TaskPipelineIntervalResult result =
-        TaskPipelineIntervalAnalyzer(*schedule_result).analyze();
-    emitPipelineIntervalInfo(func, result);
+    std::string error;
+    FailureOr<TaskPipelineIntervalResult> result =
+        TaskPipelineIntervalAnalyzer(*schedule_result).analyze(error);
+    if (failed(result)) {
+      func.emitError() << error;
+      signalPassFailure();
+      return;
+    }
+    emitPipelineIntervalInfo(func, *result);
   }
 };
 

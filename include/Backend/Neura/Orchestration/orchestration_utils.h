@@ -94,11 +94,21 @@ FailureOr<std::optional<int64_t>> inferStaticTaskTripCount(TaskflowTaskOp task,
                                                            std::string &error);
 
 // Resolves the static Taskflow-level trip count without guessing. An explicit
-// positive `trip_count` attribute wins; otherwise the count is inferred from
-// Taskflow counters. Returns std::nullopt when neither source exists so callers
-// can choose an appropriate layer-specific default or fallback.
+// non-negative `trip_count` attribute wins; otherwise the count is inferred
+// from Taskflow counters. Returns std::nullopt when neither source exists so
+// callers can choose an appropriate layer-specific default or fallback.
 FailureOr<std::optional<int64_t>>
 resolveStaticTaskTripCount(TaskflowTaskOp task, std::string &error);
+
+// Resolves one task's whole-execution latency in cycles. A positive
+// `est_latency` wins. Otherwise, when `compiled_ii`, `trip_count`, and
+// `profile_info.duration` are available, derives
+// `compiled_ii * (trip_count - 1) + duration` with checked arithmetic. Falls
+// back to the profile duration and returns std::nullopt when no duration source
+// exists. Scheduler and post-schedule analysis share this function so the
+// context order and the reported interval use the same time unit.
+FailureOr<std::optional<int64_t>>
+resolveTaskExecutionDuration(TaskflowTaskOp task, std::string &error);
 
 // Returns Taskflow tasks in deterministic walk order. Analyses that need
 // protocol-specific facts should build those facts on top of this common task
@@ -237,7 +247,7 @@ public:
   explicit TaskPipelineIntervalAnalyzer(
       llvm::ArrayRef<TaskScheduleResult> schedule_result);
 
-  TaskPipelineIntervalResult analyze();
+  FailureOr<TaskPipelineIntervalResult> analyze(std::string &error);
 
 private:
   // Edge in the analysis graph that says `task` must execute before
@@ -283,6 +293,7 @@ private:
   llvm::DenseMap<Operation *, int> task_to_index_;
   llvm::SmallVector<llvm::SmallVector<ExecutionOrderEdge>> task_graph_;
   llvm::SmallVector<CgraPipelineCycle> cgra_pipeline_cycles_;
+  mutable bool arithmetic_overflow_ = false;
 };
 
 // Reusable one-shot scheduler/placer for Taskflow task graphs.
@@ -305,11 +316,11 @@ private:
 
   // Returns true if a CGRA cell is already occupied during the requested
   // time interval.
-  bool isOccupied(int row, int col, int start_time, int duration) const;
+  bool isOccupied(int row, int col, int64_t start_time, int64_t duration) const;
 
   // Marks a CGRA cell as occupied for the half-open interval
   // [start_time, start_time + duration).
-  void markOccupied(int row, int col, int start_time, int duration);
+  void markOccupied(int row, int col, int64_t start_time, int64_t duration);
 
   // Clears all task placements and CGRA occupancy state before another
   // fixed-point placement iteration.
@@ -317,7 +328,7 @@ private:
 
   // Computes the earliest start time allowed by already-placed predecessor
   // tasks.
-  int computeEarliestStartTime(const TaskNode *task_node) const;
+  int64_t computeEarliestStartTime(const TaskNode *task_node) const;
 
   // Assigns every memory node to the SRAM location closest to its accessing
   // tasks and returns whether any assignment changed.
@@ -342,8 +353,7 @@ private:
   int grid_rows_;
   int grid_cols_;
   SchedulingMode mode_;
-  int total_task_count_ = 0;
-  std::vector<std::vector<llvm::SmallVector<std::pair<int, int>, 4>>>
+  std::vector<std::vector<llvm::SmallVector<std::pair<int64_t, int64_t>, 4>>>
       cgra_occupancy_;
 };
 

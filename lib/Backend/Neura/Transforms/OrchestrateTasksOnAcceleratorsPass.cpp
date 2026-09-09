@@ -1,8 +1,8 @@
 // Orchestrate Taskflow tasks onto a multi-CGRA grid.
 
-#include "NeuraDialect/Architecture/Architecture.h"
-#include "Backend/Neura/Orchestration/RoutingCriticalPathOrchestration/RoutingCriticalPathOrchestration.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/RoutingCriticalPathOrchestration/RoutingCriticalPathOrchestration.h"
+#include "NeuraDialect/Architecture/Architecture.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 
@@ -46,7 +46,8 @@ struct OrchestrateTasksOnAcceleratorsPass
     RoutingCriticalPathOrchestration strategy(
         architecture.getMultiCgraRows(), architecture.getMultiCgraColumns(),
         mode);
-    strategy.runTaskOrchestration(getOperation());
+    if (!strategy.runTaskOrchestration(getOperation()))
+      signalPassFailure();
   }
 };
 
