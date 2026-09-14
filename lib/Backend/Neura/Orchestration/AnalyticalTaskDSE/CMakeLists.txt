@@ -1,13 +1,26 @@
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+
 add_mlir_library(MLIRAmoebaNeuraAnalyticalTaskDSE
-    SpatialShapeUtils.cpp
+  SpatialShapeUtils.cpp
+  AnalyticalTaskCandidateCommon.cpp
+  EnumerateAnalyticalTaskCandidatesPass.cpp
+  SpatialTaskCandidateSpace.cpp
 
-    PARTIAL_SOURCES_INTENDED
+  PARTIAL_SOURCES_INTENDED
 
-    LINK_LIBS PUBLIC
-    MLIRArithDialect
-    MLIRFuncDialect
-    MLIRIR
-    MLIRSupport
-    MLIRTaskflow
-    LLVMSupport
+  DEPENDS
+  MLIRAmoebaNeuraBackendPassesIncGen
+
+  LINK_LIBS PUBLIC
+  MLIRAmoebaNeuraBackendOptions
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRIR
+  MLIRNeura
+  MLIRParser
+  MLIRPass
+  MLIRSupport
+  MLIRTaskflow
+  ${dialect_libs}
+  LLVMSupport
 )
