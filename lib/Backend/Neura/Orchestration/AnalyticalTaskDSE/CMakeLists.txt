@@ -3,7 +3,10 @@ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 add_mlir_library(MLIRAmoebaNeuraAnalyticalTaskDSE
   SpatialShapeUtils.cpp
   AnalyticalTaskCandidateCommon.cpp
+  AnalyticalTaskCandidateManifest.cpp
   EnumerateAnalyticalTaskCandidatesPass.cpp
+  MaterializeAnalyticalTaskCandidatePass.cpp
+  SpatialDSEOrchestration.cpp
   SpatialTaskCandidateSpace.cpp
 
   PARTIAL_SOURCES_INTENDED
@@ -13,6 +16,7 @@ add_mlir_library(MLIRAmoebaNeuraAnalyticalTaskDSE
 
   LINK_LIBS PUBLIC
   MLIRAmoebaNeuraBackendOptions
+  MLIRAmoebaNeuraOrchestrationUtil
   MLIRArithDialect
   MLIRFuncDialect
   MLIRIR

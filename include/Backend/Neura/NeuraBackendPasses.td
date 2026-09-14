@@ -52,7 +52,8 @@ def OrchestrateTasksOnAccelerators
     Computes task resource allocation, placement, and scheduling for the
     Neura multi-CGRA architecture. Selects an orchestration strategy and
     invokes the shared scheduler. The routing-critical-path strategy is the
-    default and supports spatial and spatial-temporal scheduling.
+    default; analytical-dse-spatial consumes a materialized task candidate
+    and preserves each selected shape orientation.
   }];
   let options = [Option<
       "schedulingMode", "scheduling-mode", "std::string",
@@ -62,7 +63,8 @@ def OrchestrateTasksOnAccelerators
     Option<
       "orchestrationStrategy", "orchestration-strategy", "std::string",
       /*default=*/"\"routing-critical-path\"",
-      "Task orchestration strategy: 'routing-critical-path' (default).">];
+      "Task orchestration strategy: 'routing-critical-path' (default) or "
+      "'analytical-dse-spatial' (requires a materialized analytical task candidate).">];
   let constructor =
       "::mlir::amoeba::neura::createOrchestrateTasksOnAcceleratorsPass()";
 }
@@ -100,6 +102,31 @@ def EnumerateAnalyticalTaskCandidates
       "::mlir::amoeba::neura::createEnumerateAnalyticalTaskCandidatesPass()";
   let dependentDialects = ["mlir::arith::ArithDialect",
                            "mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def MaterializeAnalyticalTaskCandidate
+    : Pass<"materialize-analytical-task-candidate", "ModuleOp"> {
+  let summary = "Materialize one static task-shape candidate";
+  let description = [{
+    Validates a complete candidate manifest, selects one candidate by its
+    sequential ID, and writes its cgra_count and cgra_shape decisions to
+    Taskflow tasks. The analytical DSE spatial orchestration strategy consumes and
+    preserves the selected rectangle orientation. This pass does not invoke
+    the mapper. Counter annotations must match the enumeration pipeline that
+    produced the manifest.
+  }];
+  let options = [
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Taskflow function to process; inferred when exactly one exists.">,
+    Option<"candidateFile", "candidates", "std::string", /*default=*/"\"\"",
+           "Path to the candidate JSONL manifest.">,
+    Option<"candidateId", "candidate-id", "std::string", /*default=*/"\"\"",
+           "Sequential candidate ID to materialize.">
+  ];
+  let constructor =
+      "::mlir::amoeba::neura::createMaterializeAnalyticalTaskCandidatePass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
                            "mlir::taskflow::TaskflowDialect"];
 }
 
