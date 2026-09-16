@@ -108,8 +108,14 @@ predicted makespan followed by canonical candidate index.  The production
 driver invokes the complete native lowering and mapper only for top-1 by
 default.
 
-After replay, validation compares the realized graph, task-local shapes,
-placements, routes, precedences, and schedule against the selected candidate.
-A mismatch fails the run and cannot be reported as completed resource
-binding.  Every manifest is written transactionally: count or budget failure
-must leave no partial published artifact.
+Replay must preserve the selected graph variant, task-local oriented shapes,
+and mapper footprints.  Those are binding decisions, so any mismatch fails the
+run.  The predicted placement, routes, and temporal schedule are retained as
+the selection trace; after the native mapper supplies measured task costs, the
+same binder and scheduler produce a separate realized trace.  Different
+predicted and realized timing is reported as prediction error, not falsely
+reported as replay equality.  Both traces and their hashes are published so
+the graph/binding invariants and the makespan delta can be audited.
+
+Every manifest is written transactionally: count or budget failure must leave
+no partial published artifact.
