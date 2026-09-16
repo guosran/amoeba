@@ -113,6 +113,15 @@ def load_graph_variants(path: Path) -> Tuple[Mapping[str, Any], List[GraphVarian
     if footer.get("complete") is not True:
         raise RankingError("graph manifest is not complete")
 
+    artifact_directory = _object(
+        header.get("artifact_dir"), "graph artifact directory"
+    )
+    if artifact_directory.get("path_base") != "manifest_dir":
+        raise RankingError("graph artifact directory base is unsupported")
+    artifact_root = _resolved_artifact(path, artifact_directory.get("path"))
+    if not artifact_root.is_dir():
+        raise RankingError("graph artifact directory does not exist")
+
     source = _object(header.get("source"), "graph source")
     source_path = _resolved_artifact(path, source.get("path"))
     source_sha = _sha(source.get("sha256"), "graph source SHA-256")
@@ -143,7 +152,18 @@ def load_graph_variants(path: Path) -> Tuple[Mapping[str, Any], List[GraphVarian
             raise RankingError("unique graph records duplicate a structure")
         structures.add(structure)
         result = _object(record.get("result_ir"), "graph result IR")
-        ir_path = _resolved_artifact(path, result.get("path"))
+        if result.get("path_base") != "artifact_dir":
+            raise RankingError("graph result IR path base is unsupported")
+        raw_ir_path = result.get("path")
+        if not isinstance(raw_ir_path, str) or not raw_ir_path:
+            raise RankingError("graph result IR path is missing")
+        ir_path = (artifact_root / raw_ir_path).resolve()
+        try:
+            ir_path.relative_to(artifact_root)
+        except ValueError as error:
+            raise RankingError(
+                "graph result IR escapes its artifact directory"
+            ) from error
         ir_sha = _sha(result.get("sha256"), "graph result IR SHA-256")
         if not ir_path.is_file() or sha256_file(ir_path) != ir_sha:
             raise RankingError(f"graph result IR mismatch for {identifier}")
