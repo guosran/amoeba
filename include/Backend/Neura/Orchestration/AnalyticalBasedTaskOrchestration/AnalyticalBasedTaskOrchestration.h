@@ -1,7 +1,7 @@
-// Orchestration of a materialized spatial analytical DSE candidate.
+// Orchestration of a materialized analytical task candidate.
 
-#ifndef AMOEBA_SPATIAL_DSE_ORCHESTRATION_H
-#define AMOEBA_SPATIAL_DSE_ORCHESTRATION_H
+#ifndef AMOEBA_ANALYTICAL_BASED_TASK_ORCHESTRATION_H
+#define AMOEBA_ANALYTICAL_BASED_TASK_ORCHESTRATION_H
 
 #include "Backend/Neura/Orchestration/Orchestration.h"
 #include "Backend/Neura/Orchestration/orchestration_utils.h"
@@ -20,33 +20,34 @@
 namespace mlir {
 namespace taskflow {
 
-// Concrete orchestration strategy for a materialized spatial DSE candidate.
+// Orchestrates a materialized analytical task candidate.
 //
-// Its design space assigns each task a fixed-orientation rectangular region of
-// the physical CGRA grid. The materializer records one complete assignment on
-// the function and its tasks; this strategy validates and places that exact
-// assignment.
-class SpatialDSEOrchestration : public Orchestration {
+// The current candidate space varies each task's fixed-orientation rectangular
+// region. The existing scheduler may execute the materialized candidate in
+// spatial or spatial-temporal mode. Temporal candidate exploration is added
+// separately.
+class AnalyticalBasedTaskOrchestration : public Orchestration {
 public:
-  SpatialDSEOrchestration(int grid_rows = kCgraGridRows,
-                          int grid_cols = kCgraGridCols,
-                          SchedulingMode mode = SchedulingMode::SpatialTemporal)
+  AnalyticalBasedTaskOrchestration(
+      int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
+      SchedulingMode mode = SchedulingMode::SpatialTemporal)
       : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode) {}
 
   bool runTaskOrchestration(mlir::func::FuncOp func) override;
 
-  // Enumerates the fixed-orientation rectangular shape choices explored by
-  // this strategy for one physical-CGRA count.
+  // Enumerates legal fixed-orientation rectangular shapes for one CGRA count.
   static llvm::SmallVector<CgraShape>
-  getRectangularShapes(int cgraCount, int gridRows = kCgraGridRows,
-                       int gridCols = kCgraGridCols);
+  getRectangularShapes(int cgra_count, int grid_rows = kCgraGridRows,
+                       int grid_cols = kCgraGridCols);
 
   // Derives the execution count used by this strategy from constant Taskflow
   // counter chains. A task without a counter represents one execution.
   static FailureOr<std::optional<int64_t>>
   inferStaticTaskTripCount(TaskflowTaskOp task, std::string &error);
 
-  std::string getName() const override { return "analytical-dse-spatial"; }
+  std::string getName() const override {
+    return "analytical-based-task-orchestration";
+  }
 
 private:
   using TaskSuccessorMap =
@@ -71,4 +72,4 @@ private:
 } // namespace taskflow
 } // namespace mlir
 
-#endif // AMOEBA_SPATIAL_DSE_ORCHESTRATION_H
+#endif // AMOEBA_ANALYTICAL_BASED_TASK_ORCHESTRATION_H

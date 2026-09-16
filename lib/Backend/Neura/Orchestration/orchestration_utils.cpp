@@ -726,8 +726,9 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
   if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
     // A fixed-shape schedule is driven entirely by the materialized candidate.
     // Do not rotate its shape or enumerate a fallback when it is absent.
-    if (!shape_attr || shape_attr.getValue().empty())
+    if (!shape_attr || shape_attr.getValue().empty()) {
       return TaskPlacement{};
+    }
     shapes_to_try.push_back(
         parseCgraShapeToBase(shape_attr.getValue(), cgra_count));
   } else if (shape_attr) {
@@ -738,8 +739,9 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
     }
   }
   if (shapes_to_try.empty()) {
-    if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation)
+    if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
       return TaskPlacement{};
+    }
     shapes_to_try = getAllPlacementShapes(cgra_count);
   }
 

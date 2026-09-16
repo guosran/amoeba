@@ -1,5 +1,5 @@
-add_mlir_library(MLIRAmoebaNeuraAnalyticalTaskDSE
-    SpatialDSEOrchestration.cpp
+add_mlir_library(MLIRAmoebaNeuraAnalyticalBasedTaskOrchestration
+    AnalyticalBasedTaskOrchestration.cpp
 
     PARTIAL_SOURCES_INTENDED
 

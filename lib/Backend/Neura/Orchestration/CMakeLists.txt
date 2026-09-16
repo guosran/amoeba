@@ -15,7 +15,7 @@ add_mlir_library(MLIRAmoebaNeuraOrchestrationUtil
     LLVMSupport
 )
 
-add_subdirectory(AnalyticalTaskDSE)
+add_subdirectory(AnalyticalBasedTaskOrchestration)
 add_subdirectory(RoutingCriticalPathOrchestration)
 
 add_mlir_library(MLIRAmoebaNeuraOrchestration
@@ -29,5 +29,5 @@ add_mlir_library(MLIRAmoebaNeuraOrchestration
     LINK_LIBS PUBLIC
     MLIRAmoebaNeuraOrchestrationUtil
     MLIRAmoebaNeuraRoutingCriticalPathOrchestration
-    MLIRAmoebaNeuraAnalyticalTaskDSE
+    MLIRAmoebaNeuraAnalyticalBasedTaskOrchestration
 )

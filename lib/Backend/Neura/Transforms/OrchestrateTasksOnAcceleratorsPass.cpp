@@ -1,7 +1,7 @@
 // Orchestrate Taskflow tasks onto a multi-CGRA grid.
 
 #include "Backend/Neura/NeuraBackendPasses.h"
-#include "Backend/Neura/Orchestration/AnalyticalTaskDSE/SpatialDSEOrchestration.h"
+#include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
 #include "Backend/Neura/Orchestration/RoutingCriticalPathOrchestration/RoutingCriticalPathOrchestration.h"
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -20,8 +20,9 @@ createOrchestrationStrategy(StringRef strategy_name, int grid_rows,
       .Case("routing-critical-path",
             std::make_unique<RoutingCriticalPathOrchestration>(grid_rows,
                                                                grid_cols, mode))
-      .Case("analytical-dse-spatial", std::make_unique<SpatialDSEOrchestration>(
-                                          grid_rows, grid_cols, mode))
+      .Case("analytical-based-task-orchestration",
+            std::make_unique<AnalyticalBasedTaskOrchestration>(grid_rows,
+                                                               grid_cols, mode))
       .Default(nullptr);
 }
 
@@ -55,8 +56,8 @@ struct OrchestrateTasksOnAcceleratorsPass
   Option<std::string> orchestrationStrategy{
       *this, "orchestration-strategy",
       llvm::cl::desc("Task orchestration strategy: 'routing-critical-path' "
-                     "(default) or 'analytical-dse-spatial' (requires a "
-                     "materialized analytical task candidate)."),
+                     "(default) or 'analytical-based-task-orchestration' "
+                     "(requires a materialized analytical task candidate)."),
       llvm::cl::init("routing-critical-path")};
 
   void runOnOperation() override {

@@ -1,6 +1,6 @@
-// Orchestrates a materialized spatial analytical DSE candidate.
+// Orchestrates a materialized analytical task candidate.
 
-#include "Backend/Neura/Orchestration/AnalyticalTaskDSE/SpatialDSEOrchestration.h"
+#include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
 
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -22,30 +22,33 @@ using llvm::SmallVector;
 namespace mlir {
 namespace taskflow {
 
-SmallVector<CgraShape>
-SpatialDSEOrchestration::getRectangularShapes(int cgraCount, int gridRows,
-                                              int gridCols) {
+SmallVector<CgraShape> AnalyticalBasedTaskOrchestration::getRectangularShapes(
+    int cgra_count, int grid_rows, int grid_cols) {
   SmallVector<CgraShape> shapes;
-  if (cgraCount <= 0 || gridRows <= 0 || gridCols <= 0)
+  if (cgra_count <= 0 || grid_rows <= 0 || grid_cols <= 0) {
     return shapes;
+  }
 
-  for (int rows = 1; rows <= gridRows; ++rows) {
-    if (cgraCount % rows != 0)
+  for (int rows = 1; rows <= grid_rows; ++rows) {
+    if (cgra_count % rows != 0) {
       continue;
-    int cols = cgraCount / rows;
-    if (cols <= gridCols)
+    }
+    int cols = cgra_count / rows;
+    if (cols <= grid_cols) {
       shapes.push_back({rows, cols, true, {}});
+    }
   }
   return shapes;
 }
 
 FailureOr<std::optional<int64_t>>
-SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
-                                                  std::string &error) {
+AnalyticalBasedTaskOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
+                                                           std::string &error) {
   SmallVector<TaskflowCounterOp> counters;
   task.walk([&](TaskflowCounterOp counter) { counters.push_back(counter); });
-  if (counters.empty())
+  if (counters.empty()) {
     return std::optional<int64_t>{};
+  }
 
   if (!task.getBody().hasOneBlock()) {
     error = "task " + task.getTaskName().str() +
@@ -56,10 +59,11 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
   SmallVector<TaskflowCounterOp> roots;
   llvm::DenseMap<Value, SmallVector<TaskflowCounterOp>> children;
   for (TaskflowCounterOp counter : counters) {
-    if (Value parent = counter.getParentIndex())
+    if (Value parent = counter.getParentIndex()) {
       children[parent].push_back(counter);
-    else
+    } else {
       roots.push_back(counter);
+    }
   }
   if (roots.empty()) {
     error = "task " + task.getTaskName().str() +
@@ -67,20 +71,24 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
     return failure();
   }
 
-  auto constantIndex = [](Value value) -> FailureOr<int64_t> {
-    if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+  auto constant_index = [](Value value) -> FailureOr<int64_t> {
+    if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>()) {
       return constant.value();
+    }
     return failure();
   };
-  auto counterTripCount = [&](TaskflowCounterOp counter) -> FailureOr<int64_t> {
-    FailureOr<int64_t> lower = constantIndex(counter.getLowerBound());
-    FailureOr<int64_t> upper = constantIndex(counter.getUpperBound());
-    FailureOr<int64_t> step = constantIndex(counter.getStep());
-    if (failed(lower) || failed(upper) || failed(step))
+  auto counter_trip_count =
+      [&](TaskflowCounterOp counter) -> FailureOr<int64_t> {
+    FailureOr<int64_t> lower = constant_index(counter.getLowerBound());
+    FailureOr<int64_t> upper = constant_index(counter.getUpperBound());
+    FailureOr<int64_t> step = constant_index(counter.getStep());
+    if (failed(lower) || failed(upper) || failed(step)) {
       return failure();
+    }
     if (*step <= 0 || *upper <= *lower ||
-        (*lower < 0 && *upper > std::numeric_limits<int64_t>::max() + *lower))
+        (*lower < 0 && *upper > std::numeric_limits<int64_t>::max() + *lower)) {
       return failure();
+    }
 
     int64_t distance = *upper - *lower;
     return 1 + (distance - 1) / *step;
@@ -88,7 +96,7 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
 
   llvm::DenseSet<Operation *> active;
   llvm::DenseSet<Operation *> visited;
-  std::function<FailureOr<int64_t>(TaskflowCounterOp)> chainTripCount =
+  std::function<FailureOr<int64_t>(TaskflowCounterOp)> chain_trip_count =
       [&](TaskflowCounterOp counter) -> FailureOr<int64_t> {
     Operation *operation = counter.getOperation();
     if (!active.insert(operation).second || visited.contains(operation)) {
@@ -97,7 +105,7 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
       return failure();
     }
 
-    FailureOr<int64_t> count = counterTripCount(counter);
+    FailureOr<int64_t> count = counter_trip_count(counter);
     if (failed(count)) {
       error = "task " + task.getTaskName().str() +
               " requires constant counter bounds, a positive step, a "
@@ -105,17 +113,18 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
       return failure();
     }
 
-    int64_t longestChildChain = 1;
+    int64_t longest_child_chain = 1;
     auto found = children.find(counter.getCounterIndex());
     if (found != children.end()) {
       for (TaskflowCounterOp child : found->second) {
-        FailureOr<int64_t> childCount = chainTripCount(child);
-        if (failed(childCount))
+        FailureOr<int64_t> child_count = chain_trip_count(child);
+        if (failed(child_count)) {
           return failure();
-        longestChildChain = std::max(longestChildChain, *childCount);
+        }
+        longest_child_chain = std::max(longest_child_chain, *child_count);
       }
     }
-    if (*count > std::numeric_limits<int64_t>::max() / longestChildChain) {
+    if (*count > std::numeric_limits<int64_t>::max() / longest_child_chain) {
       error = "task " + task.getTaskName().str() +
               " requires constant counter bounds, a positive step, a "
               "non-empty range, and a trip count within int64";
@@ -124,15 +133,16 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
 
     active.erase(operation);
     visited.insert(operation);
-    return *count * longestChildChain;
+    return *count * longest_child_chain;
   };
 
   int64_t total = 1;
   for (TaskflowCounterOp root : roots) {
-    FailureOr<int64_t> rootCount = chainTripCount(root);
-    if (failed(rootCount))
+    FailureOr<int64_t> root_count = chain_trip_count(root);
+    if (failed(root_count)) {
       return failure();
-    total = std::max(total, *rootCount);
+    }
+    total = std::max(total, *root_count);
   }
   if (visited.size() != counters.size()) {
     error = "task " + task.getTaskName().str() +
@@ -144,10 +154,8 @@ SpatialDSEOrchestration::inferStaticTaskTripCount(TaskflowTaskOp task,
 
 namespace {
 
-// Parses and validates the compact cgra_shape spelling produced by the
-// analytical candidate materializer.  Keeping this check next to the static
-// strategy makes malformed or incomplete materialization fail before the
-// scheduler can consume a partial resource decision.
+// Validates the cgra_shape produced by the analytical candidate materializer
+// before the scheduler can consume an incomplete resource assignment.
 bool validateShapeString(StringRef shape_text, int cgra_count, int grid_rows,
                          int grid_cols, std::string &error) {
   size_t x_pos = shape_text.find('x');
@@ -177,13 +185,13 @@ bool validateShapeString(StringRef shape_text, int cgra_count, int grid_rows,
 }
 } // namespace
 
-bool SpatialDSEOrchestration::validateFixedShapeAttributes(
+bool AnalyticalBasedTaskOrchestration::validateFixedShapeAttributes(
     func::FuncOp func) const {
   auto candidate_id =
       func->getAttrOfType<StringAttr>("analytical_task_candidate_id");
   if (!candidate_id || candidate_id.getValue().empty()) {
     func.emitError()
-        << "analytical DSE spatial orchestration requires a non-empty "
+        << "analytical-based task orchestration requires a non-empty "
            "analytical_task_candidate_id attribute";
     return false;
   }
@@ -195,7 +203,7 @@ bool SpatialDSEOrchestration::validateFixedShapeAttributes(
     }
     if (!task->getAttrOfType<UnitAttr>(
             "amoeba.analytical_shape_orientation_fixed")) {
-      task.emitError() << "analytical DSE spatial orchestration requires "
+      task.emitError() << "analytical-based task orchestration requires "
                           "amoeba.analytical_shape_orientation_fixed";
       valid = false;
       return;
@@ -204,7 +212,7 @@ bool SpatialDSEOrchestration::validateFixedShapeAttributes(
     auto cgra_count = task->getAttrOfType<IntegerAttr>("cgra_count");
     if (!cgra_count || cgra_count.getInt() <= 0 ||
         cgra_count.getInt() > std::numeric_limits<int>::max()) {
-      task.emitError() << "analytical DSE spatial orchestration requires a "
+      task.emitError() << "analytical-based task orchestration requires a "
                           "positive cgra_count";
       valid = false;
       return;
@@ -212,7 +220,7 @@ bool SpatialDSEOrchestration::validateFixedShapeAttributes(
 
     auto cgra_shape = task->getAttrOfType<StringAttr>("cgra_shape");
     if (!cgra_shape || cgra_shape.getValue().empty()) {
-      task.emitError() << "analytical DSE spatial orchestration requires a "
+      task.emitError() << "analytical-based task orchestration requires a "
                           "non-empty cgra_shape";
       valid = false;
       return;
@@ -229,9 +237,9 @@ bool SpatialDSEOrchestration::validateFixedShapeAttributes(
   return valid;
 }
 
-void SpatialDSEOrchestration::addDependencyEdge(TaskSuccessorMap &successors,
-                                                Operation *producer,
-                                                Operation *consumer) const {
+void AnalyticalBasedTaskOrchestration::addDependencyEdge(
+    TaskSuccessorMap &successors, Operation *producer,
+    Operation *consumer) const {
   if (!producer || !consumer || producer == consumer) {
     return;
   }
@@ -241,7 +249,7 @@ void SpatialDSEOrchestration::addDependencyEdge(TaskSuccessorMap &successors,
   }
 }
 
-int SpatialDSEOrchestration::computeDependencyDepth(
+int AnalyticalBasedTaskOrchestration::computeDependencyDepth(
     Operation *task, TaskSuccessorMap &successors,
     DenseMap<Operation *, int> &depth_cache,
     DenseSet<Operation *> &visiting) const {
@@ -265,7 +273,8 @@ int SpatialDSEOrchestration::computeDependencyDepth(
   return max_child_depth;
 }
 
-TaskPriorityMap SpatialDSEOrchestration::computeRoutingCriticalPathPriority(
+TaskPriorityMap
+AnalyticalBasedTaskOrchestration::computeRoutingCriticalPathPriority(
     func::FuncOp func) const {
   SmallVector<TaskflowTaskOp> tasks;
   func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
@@ -277,17 +286,17 @@ TaskPriorityMap SpatialDSEOrchestration::computeRoutingCriticalPathPriority(
 
   for (TaskflowTaskOp consumer : tasks) {
     Operation *consumer_op = consumer.getOperation();
-    auto addProducerFromValue = [&](Value value) {
+    auto add_producer_from_value = [&](Value value) {
       if (auto producer = value.getDefiningOp<TaskflowTaskOp>()) {
         addDependencyEdge(successors, producer.getOperation(), consumer_op);
       }
     };
 
     for (Value value_input : consumer.getValueInputs()) {
-      addProducerFromValue(value_input);
+      add_producer_from_value(value_input);
     }
     for (Value operand : consumer->getOperands()) {
-      addProducerFromValue(operand);
+      add_producer_from_value(operand);
     }
   }
 
@@ -302,7 +311,7 @@ TaskPriorityMap SpatialDSEOrchestration::computeRoutingCriticalPathPriority(
   return priority;
 }
 
-bool SpatialDSEOrchestration::runTaskOrchestration(func::FuncOp func) {
+bool AnalyticalBasedTaskOrchestration::runTaskOrchestration(func::FuncOp func) {
   if (!validateFixedShapeAttributes(func)) {
     return false;
   }
