@@ -58,7 +58,10 @@ class JointProgramRankingTest(unittest.TestCase):
                     "semantic_witness": (
                         {"status": "verified", "scope": "byte-identical-source"}
                         if index == 0
-                        else {"status": "verified", "command": ["witness"]}
+                        else {
+                            "status": "verified",
+                            "command_template": "witness {source} {candidate}",
+                        }
                     ),
                 }
             )

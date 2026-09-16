@@ -173,7 +173,7 @@ def load_graph_variants(path: Path) -> Tuple[Mapping[str, Any], List[GraphVarian
             and witness.get("scope") == "byte-identical-source"
         )
         if witness.get("status") != "verified" or (
-            not is_identity and not witness.get("command")
+            not is_identity and not witness.get("command_template")
         ):
             raise RankingError(f"graph variant {identifier} is not witnessed")
         variants.append(
