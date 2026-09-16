@@ -7,6 +7,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   AnalyzeRecResMiiPass.cpp
   EnumerateAnalyticalTaskCandidatesPass.cpp
   MaterializeAnalyticalTaskCandidatePass.cpp
+  MapJointSchedulingTasksPass.cpp
   ScoreAnalyticalTaskCandidatesPass.cpp
   SpatialTaskCandidateSpace.cpp
 
@@ -23,10 +24,27 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   MLIRFuncDialect
   MLIRIR
   MLIRNeura
+  MLIRNeuraTransforms
   MLIRParser
   MLIRPass
   MLIRSupport
   MLIRTaskflow
   ${dialect_libs}
+  LLVMSupport
+)
+
+add_executable(amoeba-joint-scheduling-runtime-contract-test
+  ${PROJECT_SOURCE_DIR}/test/Backend/Neura/JointSchedulingRuntimeContractTest.cpp
+)
+
+target_link_libraries(amoeba-joint-scheduling-runtime-contract-test PRIVATE
+  MLIRAmoebaNeuraJointScheduling
+  MLIRAmoebaNeuraOrchestrationUtil
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRIR
+  MLIRParser
+  MLIRSupport
+  MLIRTaskflow
   LLVMSupport
 )

@@ -48,6 +48,21 @@
 // RUN: -o %t.dataflow.mlir
 // RUN: FileCheck %s --input-file=%t.dataflow.mlir --check-prefixes=DATAFLOW
 
+// Exercise canonical per-task mapper replay: the selected 1x1 physical shape
+// becomes one real 4x4 mapper invocation, followed by a realized trace.
+// RUN: mlir-amoeba-opt %t.dataflow.mlir \
+// RUN: '--enumerate-analytical-task-candidates=output=%t.bridge.candidates.jsonl max-cgras-per-task=1 function=_Z6kernelPiS_' \
+// RUN: --architecture-spec=%S/../../../archspec/architecture_4x4.yaml \
+// RUN: -o %t.bridge.bound.mlir
+// RUN: python3 -c 'from pathlib import Path; Path(r"%t.bridge.scores").write_text("{\"record_type\":\"header\",\"schema\":\"amoeba-analytical-task-scores\",\"function\":\"_Z6kernelPiS_\"}\n{\"record_type\":\"score\",\"schema\":\"amoeba-analytical-task-scores\",\"candidate_id\":\"candidate-0\",\"valid\":true,\"schedule_trace_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"task_costs\":[{\"task\":\"Task_0\",\"startup_cycles\":1}]}\n{\"record_type\":\"footer\",\"schema\":\"amoeba-analytical-task-scores\",\"scored_count\":1}\n")'
+// RUN: mlir-amoeba-opt %t.bridge.bound.mlir \
+// RUN: '--materialize-analytical-task-candidate=candidates=%t.bridge.candidates.jsonl candidate-id=candidate-0 function=_Z6kernelPiS_' \
+// RUN: '--map-joint-scheduling-tasks=scores=%t.bridge.scores function=_Z6kernelPiS_ candidate-id=candidate-0 expected-trace-sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb expected-score-sha256=9a6e5de9abacbd3a2fe5b2441708a491212333d917ca46ed496fe5bbb0266fa5' \
+// RUN: '--orchestrate-tasks-on-accelerators=orchestration-strategy=analytical-based-task-orchestration scheduling-mode=spatial-temporal communication-mode=none' \
+// RUN: --architecture-spec=%S/../../../archspec/architecture_4x4.yaml \
+// RUN: -o %t.bridge.replayed.mlir
+// RUN: FileCheck %s --input-file=%t.bridge.replayed.mlir --check-prefix=BRIDGE
+
 // RUN: mlir-amoeba-opt %s --convert-affine-to-taskflow \
 // RUN: --construct-hyperblock-from-task \
 // RUN: --classify-task-and-counter \
@@ -72,6 +87,16 @@
 // RUN: --architecture-spec=%S/../../../archspec/architecture_with_counter.yaml \
 // RUN: -o %t.mapped.mlir
 // RUN: FileCheck %s --input-file=%t.mapped.mlir --check-prefixes=MAPPED
+
+// BRIDGE-LABEL: func.func @_Z6kernelPiS_
+// BRIDGE-SAME: joint_scheduling_actual_makespan =
+// BRIDGE-SAME: joint_scheduling_actual_trace =
+// BRIDGE-SAME: joint_scheduling_actual_trace_sha256 = "
+// BRIDGE-SAME: joint_scheduling_replay_verified
+// BRIDGE: taskflow.task @Task_0
+// BRIDGE-SAME: amoeba.mapper_mapping_info = {compiled_ii =
+// BRIDGE-SAME: x_tiles = 4 : i32, y_tiles = 4 : i32
+// BRIDGE-SAME: amoeba.mapper_replay_verified
 
 module attributes {} {
   func.func @_Z6kernelPiS_(%arg0: memref<?xi32>, %arg1: memref<?xi32>) attributes {llvm.linkage = #llvm.linkage<external>} {

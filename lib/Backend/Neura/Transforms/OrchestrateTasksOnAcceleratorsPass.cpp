@@ -15,14 +15,15 @@ namespace {
 
 std::unique_ptr<Orchestration>
 createOrchestrationStrategy(StringRef strategy_name, int grid_rows,
-                            int grid_cols, SchedulingMode mode) {
+                            int grid_cols, SchedulingMode mode,
+                            bool communication_aware) {
   return llvm::StringSwitch<std::unique_ptr<Orchestration>>(strategy_name)
       .Case("routing-critical-path",
             std::make_unique<RoutingCriticalPathOrchestration>(grid_rows,
                                                                grid_cols, mode))
       .Case("analytical-based-task-orchestration",
-            std::make_unique<AnalyticalBasedTaskOrchestration>(grid_rows,
-                                                               grid_cols, mode))
+            std::make_unique<AnalyticalBasedTaskOrchestration>(
+                grid_rows, grid_cols, mode, communication_aware))
       .Default(nullptr);
 }
 
@@ -60,6 +61,11 @@ struct OrchestrateTasksOnAcceleratorsPass
                      "(requires a materialized joint-scheduling candidate)."),
       llvm::cl::init("routing-critical-path")};
 
+  Option<std::string> communicationMode{
+      *this, "communication-mode",
+      llvm::cl::desc("Task communication mode: 'none' or 'explicit'."),
+      llvm::cl::init("none")};
+
   void runOnOperation() override {
     SchedulingMode mode;
     if (schedulingMode.getValue() == "spatial") {
@@ -72,10 +78,26 @@ struct OrchestrateTasksOnAcceleratorsPass
       signalPassFailure();
       return;
     }
+    bool communication_aware = false;
+    if (communicationMode.getValue() == "explicit") {
+      communication_aware = true;
+    } else if (communicationMode.getValue() != "none") {
+      getOperation()->emitError()
+          << "unknown communication mode: " << communicationMode.getValue();
+      signalPassFailure();
+      return;
+    }
+    if (communication_aware && orchestrationStrategy.getValue() !=
+                                   "analytical-based-task-orchestration") {
+      getOperation()->emitError()
+          << "explicit communication requires joint resource binding";
+      signalPassFailure();
+      return;
+    }
     const neura::Architecture &architecture = neura::getArchitecture();
     std::unique_ptr<Orchestration> strategy = createOrchestrationStrategy(
         orchestrationStrategy.getValue(), architecture.getMultiCgraRows(),
-        architecture.getMultiCgraColumns(), mode);
+        architecture.getMultiCgraColumns(), mode, communication_aware);
     if (!strategy) {
       getOperation()->emitError() << "unknown task orchestration strategy: "
                                   << orchestrationStrategy.getValue();

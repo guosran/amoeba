@@ -28,7 +28,7 @@
 // RUN:   --neura-architecture-spec=%S/../../../archspec/architecture_4x4.yaml \
 // RUN:   -o /dev/null > %t.unbound.err 2>&1
 // RUN: FileCheck %s --input-file=%t.unbound.err --check-prefix=UNBOUND
-// RUN: sed 's/cgra_shape = "2x1"/cgra_shape = "2x1[(0,0)(0,1)]"/' \
+// RUN: sed 's/, cgra_shape = "2x1"/, cgra_shape = "2x1[(0,0)(0,1)]"/' \
 // RUN:   %t.materialized.mlir > %t.nonrect.mlir
 // RUN: ! mlir-amoeba-opt %t.nonrect.mlir \
 // RUN:   '--orchestrate-tasks-on-accelerators=orchestration-strategy=analytical-based-task-orchestration scheduling-mode=spatial' \
@@ -102,6 +102,6 @@ module {
 // ORCHESTRATED-NOT: amoeba.joint_shape_orientation_fixed
 // ORCHESTRATED-SAME: cgra_positions = [{col = 1 : i32, context_id = 0 : i32, row = 0 : i32}]
 // NO-REALLOCATE: resource-aware-task-optimization cannot run after a joint-scheduling candidate has fixed resource shapes
-// INCOMPLETE: candidate manifest count does not match the complete concurrently packable shape space
+// INCOMPLETE: candidate manifest count does not match the complete task-shape Cartesian product
 // UNBOUND: joint resource binding requires a non-empty joint_scheduling_candidate_id attribute
 // NONRECT: invalid fixed cgra_shape: cgra_shape has invalid rectangle dimensions

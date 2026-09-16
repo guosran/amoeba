@@ -251,7 +251,8 @@ public:
   DenseMap<Value, MemoryNode *> memref_to_node;
   DenseMap<Operation *, TaskNode *> op_to_node;
 
-  void build(func::FuncOp func) {
+  bool build(func::FuncOp func, TaskCommunicationModel *communication_model,
+             std::string &error) {
     // Phase 1: Creates a TaskNode for every TaskflowTaskOp in the function.
     size_t task_id = 0;
     func.walk([&](TaskflowTaskOp task) {
@@ -290,6 +291,24 @@ public:
         addProducerDependency(operand, consumer_node.get());
       }
     }
+
+    if (communication_model) {
+      for (auto &consumer_node : task_nodes) {
+        SmallVector<Operation *> predecessors;
+        if (!communication_model->getTaskPredecessors(
+                consumer_node->op.getOperation(), predecessors, error))
+          return false;
+        for (Operation *predecessor_op : predecessors) {
+          auto found = op_to_node.find(predecessor_op);
+          if (found == op_to_node.end()) {
+            error = "communication predecessor is outside the function";
+            return false;
+          }
+          addDependencyEdge(found->second, consumer_node.get());
+        }
+      }
+    }
+    return true;
   }
 
 private:
@@ -345,9 +364,11 @@ private:
 // computeEarliestStartTime() so that each ready task starts as soon as all
 // explicit taskflow dependencies have completed.
 TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode,
-                             ShapeSelectionPolicy shape_selection_policy)
+                             ShapeSelectionPolicy shape_selection_policy,
+                             TaskCommunicationModel *communication_model)
     : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
-      shape_selection_policy_(shape_selection_policy) {
+      shape_selection_policy_(shape_selection_policy),
+      communication_model_(communication_model) {
   cgra_occupancy_.resize(grid_rows_);
   for (auto &row : cgra_occupancy_) {
     row.resize(grid_cols_);
@@ -358,6 +379,8 @@ TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode,
 bool TaskScheduler::schedule(func::FuncOp func,
                              const TaskPriorityMap &priority) {
   schedule_makespan_ = 0;
+  schedule_entries_.clear();
+  communication_error_.clear();
   SmallVector<TaskflowTaskOp> tasks;
   func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
 
@@ -368,7 +391,11 @@ bool TaskScheduler::schedule(func::FuncOp func,
 
   // Builds Task-Memory Graph.
   TaskMemoryGraph graph;
-  graph.build(func);
+  std::string graph_error;
+  if (!graph.build(func, communication_model_, graph_error)) {
+    func.emitError() << graph_error;
+    return false;
+  }
 
   if (graph.task_nodes.empty()) {
     llvm::errs() << "No tasks to place.\n";
@@ -443,6 +470,8 @@ bool TaskScheduler::schedule(func::FuncOp func,
     if (iter > 0) {
       resetTaskPlacements(graph);
     }
+    if (communication_model_)
+      communication_model_->resetReservations();
 
     // Phase 1: Place tasks.
     for (TaskNode *task_node : sorted_tasks) {
@@ -454,6 +483,8 @@ bool TaskScheduler::schedule(func::FuncOp func,
       TaskPlacement placement = findBestPlacement(task_node, cgra_count, graph);
 
       if (placement.cgra_positions.empty()) {
+        if (!communication_error_.empty())
+          task_node->op.emitError() << communication_error_;
         return false;
       }
 
@@ -530,6 +561,13 @@ bool TaskScheduler::schedule(func::FuncOp func,
       break;
     }
     schedule_makespan_ = std::max(schedule_makespan_, start + duration);
+    TaskScheduleEntry entry;
+    entry.task = task_node->op.getOperation();
+    entry.startCycle = start;
+    entry.endCycle = start + duration;
+    for (const CgraPosition &position : task_node->placement)
+      entry.positions.push_back({position.row, position.col});
+    schedule_entries_.push_back(std::move(entry));
   }
 
   // Write output attributes.
@@ -775,11 +813,80 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
         candidate_times.end());
   }
 
-  for (int64_t t : candidate_times) {
+  for (size_t time_index = 0; time_index < candidate_times.size();
+       ++time_index) {
+    int64_t t = candidate_times[time_index];
     if (t > std::numeric_limits<int64_t>::max() - task_duration)
       continue;
     int best_score = INT_MIN;
     TaskPlacement best_at_t;
+    SmallVector<int64_t> discovered_times;
+
+    auto communicationReady = [&](const TaskPlacement &candidate, bool commit,
+                                  int64_t &ready_time) -> bool {
+      ready_time = computeEarliestStartTime(task_node);
+      if (!communication_model_)
+        return true;
+      communication_model_->beginTrial();
+      for (TaskNode *producer : task_node->ssa_operands) {
+        if (producer->placement.empty()) {
+          communication_model_->finishTrial(false);
+          communication_error_ = "communication predecessor has no placement";
+          return false;
+        }
+        const CgraPosition &first_source = producer->placement.front();
+        if (first_source.start_time >
+            std::numeric_limits<int64_t>::max() - first_source.duration) {
+          communication_model_->finishTrial(false);
+          communication_error_ = "communication predecessor finish overflows";
+          return false;
+        }
+        const int64_t producer_finish =
+            first_source.start_time + first_source.duration;
+        bool found_endpoint = false;
+        int64_t best_ready = std::numeric_limits<int64_t>::max();
+        const CgraPosition *best_source = nullptr;
+        const CgraPosition *best_destination = nullptr;
+        for (const CgraPosition &source : producer->placement) {
+          for (const CgraPosition &destination : candidate.cgra_positions) {
+            int64_t endpoint_ready = 0;
+            std::string error;
+            if (!communication_model_->getTransferReadyCycle(
+                    producer->op.getOperation(), task_node->op.getOperation(),
+                    source.row, source.col, destination.row, destination.col,
+                    producer_finish, false, endpoint_ready, error)) {
+              communication_model_->finishTrial(false);
+              communication_error_ = error;
+              return false;
+            }
+            if (!found_endpoint || endpoint_ready < best_ready) {
+              found_endpoint = true;
+              best_ready = endpoint_ready;
+              best_source = &source;
+              best_destination = &destination;
+            }
+          }
+        }
+        if (!found_endpoint) {
+          communication_model_->finishTrial(false);
+          communication_error_ = "communication transfer has no endpoint";
+          return false;
+        }
+        std::string error;
+        if (!communication_model_->getTransferReadyCycle(
+                producer->op.getOperation(), task_node->op.getOperation(),
+                best_source->row, best_source->col, best_destination->row,
+                best_destination->col, producer_finish, true, best_ready,
+                error)) {
+          communication_model_->finishTrial(false);
+          communication_error_ = error;
+          return false;
+        }
+        ready_time = std::max(ready_time, best_ready);
+      }
+      communication_model_->finishTrial(commit);
+      return true;
+    };
 
     for (const CgraShape &shape : shapes_to_try) {
       SmallVector<std::pair<int, int>> shape_offsets;
@@ -813,6 +920,13 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
           if (!valid) {
             continue;
           }
+          int64_t ready_time = 0;
+          if (!communicationReady(candidate, false, ready_time))
+            return TaskPlacement{};
+          if (ready_time > t) {
+            discovered_times.push_back(ready_time);
+            continue;
+          }
           int score = computeScore(task_node, candidate, graph);
           if (score > best_score) {
             best_score = score;
@@ -823,8 +937,17 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
     }
 
     if (!best_at_t.cgra_positions.empty()) {
+      int64_t ignored_ready = 0;
+      if (!communicationReady(best_at_t, true, ignored_ready))
+        return TaskPlacement{};
       return best_at_t;
     }
+
+    candidate_times.append(discovered_times.begin(), discovered_times.end());
+    llvm::sort(candidate_times);
+    candidate_times.erase(
+        std::unique(candidate_times.begin(), candidate_times.end()),
+        candidate_times.end());
 
     if (mode_ == SchedulingMode::Spatial) {
       break;

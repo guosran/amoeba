@@ -20,6 +20,8 @@ namespace joint_scheduling {
 struct ManifestHeader {
   std::string function;
   std::string architectureSha256;
+  std::string graphVariantId;
+  std::string graphVariantSha256;
   int64_t gridRows = 0;
   int64_t gridCols = 0;
   int64_t perCgraRows = 0;
@@ -53,8 +55,8 @@ using CandidateConsumer =
 //   candidate.choices[0].shape == RectShape{1, 2, 4, 8}
 //
 // A successful parse guarantees header/candidate/footer ordering, current IR
-// and architecture identity, canonical candidate order, exact concurrent
-// packing, and completeness of the finite candidate space.
+// and architecture identity, canonical candidate order, per-task grid fit,
+// and completeness of the finite Cartesian candidate space.
 bool readCandidateManifest(llvm::StringRef path,
                            llvm::ArrayRef<TaskMetadata> tasks,
                            llvm::StringRef expectedFunction,

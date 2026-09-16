@@ -29,8 +29,10 @@ class AnalyticalBasedTaskOrchestration : public Orchestration {
 public:
   AnalyticalBasedTaskOrchestration(
       int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
-      SchedulingMode mode = SchedulingMode::SpatialTemporal)
-      : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode) {}
+      SchedulingMode mode = SchedulingMode::SpatialTemporal,
+      bool communication_aware = false)
+      : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
+        communication_aware_(communication_aware) {}
 
   bool runTaskOrchestration(mlir::func::FuncOp func) override;
 
@@ -62,6 +64,7 @@ private:
   int grid_rows_;
   int grid_cols_;
   SchedulingMode mode_;
+  bool communication_aware_ = false;
 };
 
 } // namespace taskflow

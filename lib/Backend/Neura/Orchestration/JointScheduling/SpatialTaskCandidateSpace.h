@@ -1,8 +1,8 @@
 //===- SpatialTaskCandidateSpace.h -----------------------------*- C++ -*-===//
 //
-// Defines the fixed-orientation spatial shape alphabet and its exact
-// simultaneous packing traversal. A future temporal candidate space can live
-// beside this file while sharing task metadata and output helpers.
+// Defines the fixed-orientation spatial shape alphabet and its Cartesian
+// traversal. Resource feasibility is intentionally deferred to the production
+// spatial-temporal scheduler, where non-overlapping tasks may reuse CGRAs.
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,9 +29,9 @@ namespace joint_scheduling {
 inline constexpr llvm::StringLiteral kShapePolicy =
     "static-oriented-rectangles";
 inline constexpr llvm::StringLiteral kSearchScope =
-    "static-shape-concurrent-fit";
+    "static-shape-cartesian-product";
 inline constexpr llvm::StringLiteral kSpatialCapacityPolicy =
-    "all-tasks-simultaneous-exact-pack";
+    "per-task-fit-temporal-reuse-allowed";
 inline constexpr llvm::StringLiteral kShapePruningPolicy = "none";
 inline constexpr llvm::StringLiteral kSpatialCandidateBudgetPolicy =
     "fail-before-publish";
@@ -63,39 +63,18 @@ struct Candidate {
 using ShapeIndexTupleConsumer =
     llvm::function_ref<bool(uint64_t, llvm::ArrayRef<size_t>)>;
 
-// Memoizes exact physical-grid packing by the sorted multiset of oriented
-// rectangles. Task names and task order do not affect whether the rectangles
-// fit, so many ordered candidates share one small backtracking result.
-class ConcurrentPackingCache {
-public:
-  ConcurrentPackingCache(int64_t gridRows, int64_t gridCols)
-      : gridRows_(gridRows), gridCols_(gridCols) {}
-
-  bool canPack(llvm::ArrayRef<RectShape> shapes);
-  int64_t gridRows() const { return gridRows_; }
-  int64_t gridCols() const { return gridCols_; }
-
-private:
-  using Key = std::vector<std::pair<int64_t, int64_t>>;
-
-  int64_t gridRows_ = 0;
-  int64_t gridCols_ = 0;
-  std::map<Key, bool> results_;
-};
-
 llvm::SmallVector<RectShape> enumerateStaticRectShapes(int64_t gridRows,
                                                        int64_t gridCols,
                                                        int64_t perCgraRows,
                                                        int64_t perCgraCols,
                                                        int64_t maxCgrasPerTask);
-// Visits every shape tuple that admits a simultaneous, non-overlapping
-// placement on the physical grid. `shapeIndices` follows task order and indexes
-// the corresponding task's shape alphabet; the valid candidate index is
-// contiguous and starts at zero. Returns
-// false only when the consumer requests an early stop.
-bool visitConcurrentlyPackableShapeTuples(
+// Visits the complete per-task shape Cartesian product. Each shape already
+// fits the physical grid on its own; whole-program feasibility is determined
+// later by the production spatial-temporal scheduler. `shapeIndices` follows
+// task order and the candidate index is contiguous from zero.
+bool visitShapeCartesianProduct(
     llvm::ArrayRef<llvm::SmallVector<RectShape>> shapesByTask,
-    ConcurrentPackingCache &packing, ShapeIndexTupleConsumer consume);
+    ShapeIndexTupleConsumer consume);
 llvm::json::Object candidateJson(const Candidate &candidate);
 } // namespace joint_scheduling
 } // namespace neura

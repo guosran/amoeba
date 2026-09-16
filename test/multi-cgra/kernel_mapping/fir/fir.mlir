@@ -63,9 +63,7 @@
 // RUN: --workload-domain=static_tensor \
 // RUN: --predictor-checkpoint=%S/../../../../thirdparty/cgra-ii-predictor/models/reference-candidate/checkpoint.json \
 // RUN: --allow-provisional-checkpoint \
-// RUN: --output-dir=%t.joint-scheduling --top-k=1 -- \
-// RUN: --insert-data-mov \
-// RUN: '--map-to-accelerator=mapping-strategy=heuristic' \
+// RUN: --output-dir=%t.joint-scheduling --top-k=1 \
 // RUN: 2>&1 | FileCheck %s --check-prefix=PREDICTOR-SCOPE
 
 // RUN: mlir-amoeba-opt %s --convert-affine-to-taskflow \

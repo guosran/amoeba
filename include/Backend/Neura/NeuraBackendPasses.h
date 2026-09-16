@@ -28,6 +28,7 @@ std::unique_ptr<Pass> createAnalyzeRecResMiiPass();
 std::unique_ptr<Pass> createEnumerateAnalyticalTaskCandidatesPass();
 std::unique_ptr<Pass> createScoreAnalyticalTaskCandidatesPass();
 std::unique_ptr<Pass> createMaterializeAnalyticalTaskCandidatePass();
+std::unique_ptr<Pass> createMapJointSchedulingTasksPass();
 std::unique_ptr<Pass> createFuseTaskPass();
 std::unique_ptr<Pass> createResourceAwareTaskOptimizationPass();
 

@@ -104,6 +104,21 @@ struct MaterializeAnalyticalTaskCandidatePass
                           "manifest";
       return signalPassFailure();
     }
+    auto graphVariantId =
+        func->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
+    auto graphVariantSha =
+        func->getAttrOfType<StringAttr>("amoeba.graph_variant_sha256");
+    if ((graphVariantId &&
+         graphVariantId.getValue() != header.graphVariantId) ||
+        (graphVariantSha &&
+         graphVariantSha.getValue() != header.graphVariantSha256) ||
+        static_cast<bool>(graphVariantId) != !header.graphVariantId.empty() ||
+        static_cast<bool>(graphVariantSha) !=
+            !header.graphVariantSha256.empty()) {
+      func.emitError() << "candidate manifest graph variant identity does not "
+                          "match the selected IR";
+      return signalPassFailure();
+    }
 
     // Delays mutation until the manifest, IR, architecture, and record have
     // all been validated. These attributes configure the unchanged downstream
@@ -122,6 +137,17 @@ struct MaterializeAnalyticalTaskCandidatePass
                            static_cast<int32_t>(choice.shape.cgraCount())));
       task.op->setAttr("cgra_shape", builder.getStringAttr(
                                          choice.shape.toCgraShapeAttrValue()));
+      task.op->setAttr("amoeba.selected_cgra_count",
+                       builder.getI64IntegerAttr(choice.shape.cgraCount()));
+      task.op->setAttr(
+          "amoeba.selected_cgra_shape",
+          builder.getStringAttr(choice.shape.toCgraShapeAttrValue()));
+      task.op->setAttr("amoeba.selected_mapper_tile_rows",
+                       builder.getI64IntegerAttr(choice.shape.mapperRows));
+      task.op->setAttr("amoeba.selected_mapper_tile_cols",
+                       builder.getI64IntegerAttr(choice.shape.mapperCols));
+      task.op->setAttr("amoeba.selected_trip_count",
+                       builder.getI64IntegerAttr(choice.tripCount));
       // The rectangle orientation is part of the selected candidate and must
       // remain unchanged during resource allocation.
       task.op->setAttr("amoeba.joint_shape_orientation_fixed",
@@ -131,6 +157,14 @@ struct MaterializeAnalyticalTaskCandidatePass
                   builder.getStringAttr(selected->id));
     func->setAttr("joint_scheduling_candidate_scope",
                   builder.getStringAttr(kSearchScope));
+    func->setAttr("joint_scheduling_architecture_sha256",
+                  builder.getStringAttr(header.architectureSha256));
+    if (!header.graphVariantId.empty()) {
+      func->setAttr("joint_scheduling_graph_variant_id",
+                    builder.getStringAttr(header.graphVariantId));
+      func->setAttr("joint_scheduling_graph_variant_sha256",
+                    builder.getStringAttr(header.graphVariantSha256));
+    }
   }
 };
 

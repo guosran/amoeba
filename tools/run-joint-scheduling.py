@@ -52,6 +52,67 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _schedule_trace_sha256(trace: Mapping[str, object]) -> str:
+    """Hash the ordered, typed schedule tuple shared with the C++ scorer."""
+    def length_prefixed(value: object) -> str:
+        text = str(value)
+        return f"{len(text.encode('utf-8'))}:{text}"
+
+    lines = [
+        "joint-schedule-trace-v2",
+        str(trace.get("candidate_id")),
+        str(trace.get("architecture_sha256")),
+        str(trace.get("communication_mode")),
+    ]
+    for task in trace.get("task_schedule", []):
+        fields = [
+            "T", length_prefixed(task["task"]), str(task["start_cycle"]),
+            str(task["end_cycle"]),
+        ]
+        fields.extend(
+            f'{cell["row"]},{cell["col"]}'
+            for cell in task["cgra_positions"]
+        )
+        lines.append("|".join(fields))
+    for edge in trace.get("dependencies", []):
+        lines.append("|".join([
+            "D", length_prefixed(edge["producer"]),
+            length_prefixed(edge["consumer"]),
+            str(edge["kind"]), str(edge["producer_segment"]),
+            str(edge["producer_index"]), str(edge["consumer_segment"]),
+            str(edge["consumer_index"]),
+            str(edge.get("payload_bits", "-")),
+        ]))
+    for route in trace.get("routes", []):
+        fields = [
+            "R", length_prefixed(route["producer"]),
+            length_prefixed(route["consumer"]),
+            f'{route["source_row"]},{route["source_col"]}',
+            f'{route["destination_row"]},{route["destination_col"]}',
+            str(route["payload_bits"]), str(route["ready_cycle"]),
+            str(route["path_latency_cycles"]),
+            str(route["bottleneck_bandwidth_bits_per_cycle"]),
+            str(route["transfer_cycles"]),
+        ]
+        fields.extend(f"e{index}" for index in route["edge_indices"])
+        for link in route["links"]:
+            if link["resource_kind"] == "local_channel":
+                fields.append(
+                    f'c{link["row"]},{link["col"]},'
+                    f'{link["start_cycle"]},{link["end_cycle"]}'
+                )
+            elif link["resource_kind"] == "network_link":
+                fields.append(
+                    f'l{link["link_index"]},{link["start_cycle"]},'
+                    f'{link["end_cycle"]}'
+                )
+            else:
+                raise PipelineError("unknown trace communication resource")
+        lines.append("|".join(fields))
+    encoded = "\n".join(lines) + "\n"
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def _require_file(path: Path, label: str, executable: bool = False) -> Path:
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
@@ -219,8 +280,9 @@ def _require_bound_trip_counts(path: Path) -> None:
 
 
 def _read_shortlist(path: Path, candidate_manifest: Path,
-                    cost_catalog: Path,
-                    architecture: Path) -> List[Mapping[str, object]]:
+                    cost_catalog: Path, architecture: Path,
+                    communication_mode: str, graph_variant_id: str,
+                    graph_variant_sha256: str) -> List[Mapping[str, object]]:
     """Validate the complete score artifact chain before replaying any ID."""
     header = None
     footer = None
@@ -284,6 +346,12 @@ def _read_shortlist(path: Path, candidate_manifest: Path,
         or candidate_architecture.get("spec_sha256") != architecture_sha
         or header.get("cost_namespace") != catalog.get("namespace")
         or header.get("function") != candidate_header.get("function")
+        or header.get("communication_mode") != communication_mode
+        or header.get("graph_variant_id") != graph_variant_id
+        or header.get("graph_variant_sha256") != graph_variant_sha256
+        or candidate_header.get("graph_variant_id") != graph_variant_id
+        or candidate_header.get("graph_variant_sha256")
+        != graph_variant_sha256
     ):
         raise PipelineError("score manifest provenance does not match its inputs")
     valid_scores = {
@@ -316,7 +384,20 @@ def _read_shortlist(path: Path, candidate_manifest: Path,
         ):
             raise PipelineError("score shortlist is inconsistent with valid scores")
         selected.add(candidate_id)
-    return shortlist
+    enriched = []
+    for item in shortlist:
+        score = valid_scores[str(item["candidate_id"])]
+        trace = score.get("schedule_trace")
+        trace_sha = score.get("schedule_trace_sha256")
+        if not isinstance(trace, dict) or not isinstance(trace_sha, str):
+            raise PipelineError("shortlisted score has no canonical schedule trace")
+        if _schedule_trace_sha256(trace) != trace_sha:
+            raise PipelineError("shortlisted schedule trace identity is invalid")
+        replay = dict(item)
+        replay["schedule_trace"] = trace
+        replay["schedule_trace_sha256"] = trace_sha
+        enriched.append(replay)
+    return enriched
 
 
 def _option(name: str, values: Iterable[tuple[str, object]]) -> str:
@@ -330,6 +411,18 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
     input_path = _require_file(args.input, "input MLIR")
     architecture = _require_file(args.architecture, "architecture YAML")
     amoeba_opt = _require_file(args.amoeba_opt, "mlir-amoeba-opt", executable=True)
+    predictor_checkpoint = _require_file(
+        args.predictor_checkpoint, "predictor checkpoint"
+    )
+    graph_variant_sha256 = _sha256_file(input_path)
+    if (
+        args.graph_variant_sha256 is not None
+        and args.graph_variant_sha256 != graph_variant_sha256
+    ):
+        raise PipelineError(
+            "graph variant SHA-256 does not match the exact input IR bytes"
+        )
+    graph_variant_id = args.graph_variant_id
     output = _prepare_output(args.output_dir)
 
     required_adapters = {
@@ -346,6 +439,7 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
 
     manifest = output / "candidates.jsonl"
     bound_ir = output / "bound.mlir"
+    expanded_ir = output / "route-expanded.mlir"
     task_dir = output / "task-dfgs"
     task_index = output / "task-dfgs.json"
     predictor_input = output / "predictor-input.json"
@@ -362,6 +456,8 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
             ("max-cgras-per-task", args.max_cgras_per_task),
             ("max-candidates", args.max_candidates),
             ("function", args.function),
+            ("graph-variant-id", graph_variant_id),
+            ("graph-variant-sha256", graph_variant_sha256),
         ),
     )
     _run(
@@ -385,9 +481,29 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
                 "task names"
             )
 
+    # Predictor analysis and inference consume one immutable route-expanded
+    # DFG representation.  Enumeration remains bound to the source task body;
+    # InsertDataMov preserves the embedded source-body SHA while deterministically
+    # expanding each kernel exactly once in this derived artifact.
+    _run(
+        [str(amoeba_opt), str(bound_ir), "--insert-data-mov",
+         "-o", str(expanded_ir)],
+        "expand-task-dfg-routes", output,
+    )
+    expanded_text = expanded_ir.read_text()
+    for task in selected_tasks:
+        occurrences = len(re.findall(
+            rf"\btaskflow\.task\s+@{re.escape(task)}\b", expanded_text
+        ))
+        if occurrences != 1:
+            raise PipelineError(
+                f"route-expanded task {task} occurs {occurrences} times; "
+                "every selected graph variant must retain exactly one task"
+            )
+
     extract_command = [
         sys.executable, str(required_adapters["extract"]),
-        "--input", str(bound_ir), "--output-dir", str(task_dir),
+        "--input", str(expanded_ir), "--output-dir", str(task_dir),
         "--index-output", str(task_index),
     ]
     _run(extract_command, "extract-task-dfgs", output)
@@ -410,9 +526,7 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
          "--output", str(cost_catalog),
          "--timing-output", str(inference_timing),
          "--device", args.device,
-         "--checkpoint", str(_require_file(
-             args.predictor_checkpoint, "predictor checkpoint"
-         )),
+         "--checkpoint", str(predictor_checkpoint),
          *(["--allow-provisional-checkpoint"]
            if args.allow_provisional_checkpoint else []),
          *(["--allow-test-fixture"] if args.allow_test_fixture else [])],
@@ -423,6 +537,9 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
         "score-analytical-task-candidates",
         (("candidates", manifest), ("cost-file", cost_catalog),
          ("output", scores), ("top-k", args.top_k),
+         ("communication-mode", args.communication_mode),
+         ("graph-variant-id", graph_variant_id),
+         ("graph-variant-sha256", graph_variant_sha256),
          ("function", args.function)),
     )
     _run(
@@ -432,23 +549,21 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
     )
 
     downstream = list(args.downstream_args)
-    shortlist = _read_shortlist(scores, manifest, cost_catalog, architecture)
-    shapes_by_candidate = _candidate_shapes(manifest)
-    mapper_requested = _requests_pass(downstream, "map-to-accelerator")
-    resource_binding_requested = _requests_pass(
-        downstream, "orchestrate-tasks-on-accelerators"
+    shortlist = _read_shortlist(
+        scores, manifest, cost_catalog, architecture, args.communication_mode,
+        graph_variant_id, graph_variant_sha256,
     )
-    for item in shortlist:
-        candidate_id = str(item["candidate_id"])
-        shapes = shapes_by_candidate.get(candidate_id)
-        if shapes is None:
-            raise PipelineError("shortlisted candidate has no shape record")
-        if mapper_requested and any(shape["cgra_count"] != 1 for shape in shapes):
-            raise PipelineError(
-                "per-task full mapping for multi-CGRA shapes is not "
-                "implemented; refusing to run the module-level mapper with "
-                f"candidate {candidate_id}"
-            )
+    shapes_by_candidate = _candidate_shapes(manifest)
+    if _requests_pass(downstream, "map-to-accelerator"):
+        raise PipelineError(
+            "module-level map-to-accelerator is incompatible with selected "
+            "per-task rectangles; the driver runs per-task mapper replay"
+        )
+    if _requests_pass(downstream, "orchestrate-tasks-on-accelerators"):
+        raise PipelineError(
+            "resource binding is part of canonical replay; do not request a "
+            "second orchestration pass"
+        )
     shortlist_root = output / "shortlist"
     shortlist_root.mkdir()
     materialized = []
@@ -463,12 +578,60 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
             (("candidates", manifest), ("candidate-id", candidate_id),
              ("function", args.function)),
         )
+        orchestration_option = _option(
+            "orchestrate-tasks-on-accelerators",
+            (
+                ("orchestration-strategy",
+                 "analytical-based-task-orchestration"),
+                ("scheduling-mode", "spatial-temporal"),
+                ("communication-mode", args.communication_mode),
+            ),
+        )
+        mapper_option = _option(
+            "map-joint-scheduling-tasks",
+            (("scores", scores), ("candidate-id", candidate_id),
+             ("function", args.function),
+             ("expected-trace-sha256", item["schedule_trace_sha256"]),
+             ("expected-score-sha256", _sha256_file(scores))),
+        )
         _run(
             [str(amoeba_opt), str(bound_ir), materialize_option,
+             mapper_option, orchestration_option,
              f"--architecture-spec={architecture}", *downstream,
              "-o", str(candidate_output)],
             f"top-{rank}-{candidate_id}", output, cwd=candidate_root,
         )
+        replay_text = candidate_output.read_text()
+        if (
+            replay_text.count("amoeba.mapper_replay_verified")
+            != len(shapes_by_candidate[candidate_id])
+            or "joint_scheduling_replay_verified" not in replay_text
+            or "joint_scheduling_actual_makespan" not in replay_text
+            or "joint_scheduling_actual_trace" not in replay_text
+            or "joint_scheduling_actual_trace_sha256" not in replay_text
+        ):
+            raise PipelineError(
+                f"canonical replay did not verify every task for {candidate_id}"
+            )
+        makespan_match = re.search(
+            r"joint_scheduling_actual_makespan\s*=\s*(-?[0-9]+)", replay_text
+        )
+        if makespan_match is None or int(makespan_match.group(1)) <= 0:
+            raise PipelineError(
+                f"canonical replay has no positive realized makespan for "
+                f"{candidate_id}"
+            )
+        actual_makespan = int(makespan_match.group(1))
+        actual_trace_match = re.search(
+            r'joint_scheduling_actual_trace_sha256\s*=\s*"([0-9a-f]{64})"',
+            replay_text,
+        )
+        if actual_trace_match is None:
+            raise PipelineError(
+                f"canonical replay has no actual trace identity for "
+                f"{candidate_id}"
+            )
+        actual_trace_sha256 = actual_trace_match.group(1)
         materialized.append({
             "rank": rank,
             "candidate_id": candidate_id,
@@ -476,21 +639,38 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
                 "predicted_scheduler_makespan"
             ),
             "output": str(candidate_output),
+            "predicted_schedule_trace_sha256": item[
+                "schedule_trace_sha256"
+            ],
+            "actual_schedule_trace_sha256": actual_trace_sha256,
+            "real_mapper_status": "verified",
+            "runtime_invariants_status": "verified_by_runtime_pass",
+            "predicted_trace_replay_status":
+                "recomputed_with_real_mapper_costs",
+            "prediction_matches_actual_trace": actual_trace_sha256
+            == item["schedule_trace_sha256"],
+            "actual_scheduler_makespan": actual_makespan,
+            "prediction_matches_actual_makespan": actual_makespan
+            == item.get("predicted_scheduler_makespan"),
         })
 
     report = {
         "input": str(input_path),
         "architecture": str(architecture),
         "predictor_submodule": str(PREDICTOR_ROOT),
+        "predictor_checkpoint": str(predictor_checkpoint),
+        "predictor_checkpoint_sha256": _sha256_file(predictor_checkpoint),
+        "workload_domain": args.workload_domain,
+        "graph_variant_id": graph_variant_id,
+        "graph_variant_sha256": graph_variant_sha256,
         "predictor_status": "pending_review",
         "replay_contract": {
             "full_mapper_status": (
-                "completed_single_cgra" if mapper_requested else "not_requested"
+                "completed_per_task_fixed_rectangle"
             ),
-            "multi_cgra_full_mapping_supported": False,
-            "resource_binding_status": (
-                "completed" if resource_binding_requested else "not_requested"
-            ),
+            "multi_cgra_full_mapping_supported": True,
+            "resource_binding_status": "verified",
+            "communication_mode": args.communication_mode,
         },
         "top_k_requested": args.top_k,
         "shortlist_materialization_invocations": len(materialized),
@@ -498,6 +678,8 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
         "artifacts": {
             "candidate_manifest": str(manifest),
             "bound_ir": str(bound_ir),
+            "route_expanded_ir": str(expanded_ir),
+            "route_expanded_ir_sha256": _sha256_file(expanded_ir),
             "task_dfg_index": str(task_index),
             "predictor_input": str(predictor_input),
             "analysis_timing": str(analysis_timing),
@@ -548,12 +730,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--predictor-checkpoint", type=Path, required=True)
     parser.add_argument(
+        "--graph-variant-id", default="identity",
+        help="stable graph variant ID; identity is used for an untransformed input",
+    )
+    parser.add_argument(
+        "--graph-variant-sha256",
+        help="optional asserted SHA-256 of the exact graph result IR bytes",
+    )
+    parser.add_argument(
         "--allow-provisional-checkpoint", action="store_true",
         help="review-only use of a checkpoint that has not passed promotion",
     )
     parser.add_argument(
         "--allow-test-fixture", action="store_true",
         help="offline tests only; never a prediction-quality claim",
+    )
+    parser.add_argument(
+        "--communication-mode", choices=("none", "explicit"), default="none",
+        help="use strict payload-aware shared-link communication scheduling",
     )
     args = parser.parse_args(raw_arguments)
     args.downstream_args = downstream_arguments

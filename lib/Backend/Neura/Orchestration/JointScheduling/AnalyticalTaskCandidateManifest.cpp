@@ -134,10 +134,24 @@ static bool parseHeader(const llvm::json::Object &object,
       !maxCgras) {
     return false;
   }
-  header = {function->str(), architectureSha->str(),
-            *gridRows,       *gridCols,
-            *perRows,        *perCols,
-            *maxCgras,       *maxCandidates};
+  std::optional<StringRef> graphVariantId =
+      object.getString("graph_variant_id");
+  std::optional<StringRef> graphVariantSha =
+      object.getString("graph_variant_sha256");
+  if (graphVariantId.has_value() != graphVariantSha.has_value()) {
+    error = "candidate manifest graph variant identity is incomplete";
+    return false;
+  }
+  header = {function->str(),
+            architectureSha->str(),
+            graphVariantId ? graphVariantId->str() : std::string(),
+            graphVariantSha ? graphVariantSha->str() : std::string(),
+            *gridRows,
+            *gridCols,
+            *perRows,
+            *perCols,
+            *maxCgras,
+            *maxCandidates};
   if (header.gridRows <= 0 || header.gridCols <= 0 || header.perCgraRows <= 0 ||
       header.perCgraCols <= 0 || header.maxCgrasPerTask <= 0) {
     error = "candidate manifest dimensions must be positive";
@@ -145,6 +159,13 @@ static bool parseHeader(const llvm::json::Object &object,
   }
   if (!isSha256(header.architectureSha256)) {
     error = "candidate manifest architecture SHA-256 is invalid";
+    return false;
+  }
+  if ((!header.graphVariantSha256.empty() &&
+       !isSha256(header.graphVariantSha256)) ||
+      (!header.graphVariantId.empty() &&
+       StringRef(header.graphVariantId).trim().empty())) {
+    error = "candidate manifest graph variant identity is invalid";
     return false;
   }
   return true;
@@ -267,14 +288,12 @@ static bool parseCandidate(const llvm::json::Object &object,
   return true;
 }
 
-// Verifies one record from the filtered candidate stream. IDs are contiguous
-// among packable tuples. Shape tuples themselves must remain in the
-// lexicographic order produced by visitConcurrentlyPackableShapeTuples; this
-// rejects duplicates and reordering without storing the entire manifest.
+// Verifies one record from the Cartesian candidate stream. Shape tuples must
+// remain in the lexicographic order produced by visitShapeCartesianProduct;
+// this rejects duplicates and reordering without storing the entire manifest.
 static bool validateCandidateAtIndex(
     uint64_t index, ArrayRef<TaskMetadata> tasks,
-    ArrayRef<SmallVector<RectShape>> shapesByTask,
-    ConcurrentPackingCache &packing, const Candidate &candidate,
+    ArrayRef<SmallVector<RectShape>> shapesByTask, const Candidate &candidate,
     SmallVectorImpl<size_t> &previousShapeIndices, std::string &error) {
   if (candidate.id != makeSequentialCandidateId(index)) {
     error = "candidate ID does not match its canonical manifest index";
@@ -285,7 +304,6 @@ static bool validateCandidateAtIndex(
     return false;
   }
   SmallVector<size_t> shapeIndices;
-  SmallVector<RectShape> selectedShapes;
   for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
     const RectShape &candidateShape = candidate.choices[taskIndex].shape;
     ArrayRef<RectShape> shapes = shapesByTask[taskIndex];
@@ -297,12 +315,6 @@ static bool validateCandidateAtIndex(
       return false;
     }
     shapeIndices.push_back(static_cast<size_t>(found - shapes.begin()));
-    selectedShapes.push_back(candidateShape);
-  }
-  if (!packing.canPack(selectedShapes)) {
-    error = "candidate task rectangles cannot fit simultaneously on the "
-            "physical CGRA grid";
-    return false;
   }
   if (!previousShapeIndices.empty() &&
       !std::lexicographical_compare(previousShapeIndices.begin(),
@@ -315,17 +327,16 @@ static bool validateCandidateAtIndex(
   return true;
 }
 
-// Counts the exact concurrently packable space, but stops as soon as it proves
+// Counts the exact Cartesian space, but stops as soon as it proves
 // that the manifest's declared count is too small. Combined with strictly
 // increasing legal records, equal counts prove that no valid tuple is missing.
 static bool
-hasExactPackableCandidateCount(uint64_t declaredCount,
-                               ArrayRef<SmallVector<RectShape>> shapesByTask,
-                               ConcurrentPackingCache &packing) {
+hasExactCandidateCount(uint64_t declaredCount,
+                       ArrayRef<SmallVector<RectShape>> shapesByTask) {
   uint64_t computedCount = 0;
   bool exceededDeclaredCount = false;
-  bool completed = visitConcurrentlyPackableShapeTuples(
-      shapesByTask, packing, [&](uint64_t index, ArrayRef<size_t>) {
+  bool completed = visitShapeCartesianProduct(
+      shapesByTask, [&](uint64_t index, ArrayRef<size_t>) {
         if (index >= declaredCount) {
           exceededDeclaredCount = true;
           return false;
@@ -364,9 +375,9 @@ static bool architectureMatches(const ManifestHeader &header,
 }
 
 // Streams and validates a complete candidate manifest before forwarding each
-// candidate to the consumer. Every record must be a legal, concurrently
-// packable shape tuple in canonical order. The footer is checked against an
-// independent traversal of the exact packable space.
+// candidate to the consumer. Every record must be a legal shape tuple in
+// canonical order. The footer is checked against an independent traversal of
+// the exact Cartesian product.
 bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
                            StringRef expectedFunction,
                            const ::mlir::neura::Architecture &architecture,
@@ -384,7 +395,6 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
   uint64_t count = 0;
   SmallVector<SmallVector<RectShape>> legalShapesByTask;
   SmallVector<size_t> previousShapeIndices;
-  std::unique_ptr<ConcurrentPackingCache> packing;
   for (llvm::line_iterator lines(**buffer, /*SkipBlanks=*/true);
        !lines.is_at_end(); ++lines) {
     llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(*lines);
@@ -429,8 +439,6 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
         error = "candidate manifest declares an empty shape space";
         return false;
       }
-      packing = std::make_unique<ConcurrentPackingCache>(header.gridRows,
-                                                         header.gridCols);
       sawHeader = true;
       continue;
     }
@@ -440,9 +448,9 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
         return false;
       }
       Candidate candidate;
-      if (!parseCandidate(*object, tasks, candidate, error) || !packing ||
-          !validateCandidateAtIndex(count, tasks, legalShapesByTask, *packing,
-                                    candidate, previousShapeIndices, error) ||
+      if (!parseCandidate(*object, tasks, candidate, error) ||
+          !validateCandidateAtIndex(count, tasks, legalShapesByTask, candidate,
+                                    previousShapeIndices, error) ||
           !consume(count, candidate, error)) {
         return false;
       }
@@ -459,10 +467,10 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
         }
         return false;
       }
-      if (static_cast<uint64_t>(*expectedCount) != count || !packing ||
-          !hasExactPackableCandidateCount(count, legalShapesByTask, *packing)) {
+      if (static_cast<uint64_t>(*expectedCount) != count ||
+          !hasExactCandidateCount(count, legalShapesByTask)) {
         error = "candidate manifest count does not match the complete "
-                "concurrently packable shape space";
+                "task-shape Cartesian product";
         return false;
       }
       if (count > static_cast<uint64_t>(header.maxCandidates)) {

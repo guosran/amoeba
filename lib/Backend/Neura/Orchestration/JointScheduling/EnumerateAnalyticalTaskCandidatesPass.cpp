@@ -1,7 +1,7 @@
 //===- EnumerateAnalyticalTaskCandidatesPass.cpp -------------------------===//
 //
-// Implements the pass that freezes every concurrently packable rectangular
-// task-shape tuple.
+// Implements the pass that freezes the complete rectangular task-shape
+// Cartesian product.
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,6 +13,7 @@
 
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/JSON.h"
 
 #include <algorithm>
@@ -60,6 +61,14 @@ struct EnumerateAnalyticalTaskCandidatesPass
       llvm::cl::desc(
           "Limits each task footprint; zero uses the full physical grid."),
       llvm::cl::init(0)};
+  Option<std::string> graphVariantId{
+      *this, "graph-variant-id",
+      llvm::cl::desc("Optional graph variant identity; requires its SHA-256."),
+      llvm::cl::init("")};
+  Option<std::string> graphVariantSha256{
+      *this, "graph-variant-sha256",
+      llvm::cl::desc("SHA-256 of the exact graph-variant result IR bytes."),
+      llvm::cl::init("")};
 
   void runOnOperation() override {
     // Selects the Taskflow function. Besides the candidate file, a successful
@@ -78,6 +87,19 @@ struct EnumerateAnalyticalTaskCandidatesPass
         maxCgrasPerTask.getValue() < 0) {
       func.emitError() << "output, positive max-candidates, and nonnegative "
                           "max-cgras-per-task are required";
+      return signalPassFailure();
+    }
+    if (graphVariantId.getValue().empty() !=
+        graphVariantSha256.getValue().empty()) {
+      func.emitError() << "graph-variant-id and graph-variant-sha256 must be "
+                          "provided together";
+      return signalPassFailure();
+    }
+    if (!graphVariantSha256.getValue().empty() &&
+        (graphVariantSha256.getValue().size() != 64 ||
+         !llvm::all_of(graphVariantSha256.getValue(),
+                       [](char c) { return llvm::isHexDigit(c); }))) {
+      func.emitError() << "graph-variant-sha256 must be 64 hexadecimal digits";
       return signalPassFailure();
     }
 
@@ -121,20 +143,17 @@ struct EnumerateAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
 
-    // Counts the complete *feasible* shape space before publishing anything.
-    // A tuple is feasible only when its fixed-orientation task rectangles have
-    // an exact simultaneous, non-overlapping placement on the physical grid.
-    // The concrete origins remain a downstream heuristic choice; temporal
-    // reuse cannot rescue an over-capacity tuple in this search scope.
+    // Counts the complete Cartesian shape space before publishing anything.
+    // Every individual rectangle fits the grid. Whole-program feasibility is
+    // intentionally decided by the production spatial-temporal scheduler, so
+    // a candidate may use more total area than exists at one instant.
     uint64_t candidateCount = 0;
     bool exceededLimit = false;
-    ConcurrentPackingCache packing(gridRows, gridCols);
     SmallVector<SmallVector<uint8_t>> usedCostQueries(taskMetadata->size());
     for (auto [taskIndex, used] : llvm::enumerate(usedCostQueries))
       used.assign(shapesByTask[taskIndex].size(), 0);
-    bool countedAll = visitConcurrentlyPackableShapeTuples(
-        shapesByTask, packing,
-        [&](uint64_t index, ArrayRef<size_t> shapeIndices) {
+    bool countedAll = visitShapeCartesianProduct(
+        shapesByTask, [&](uint64_t index, ArrayRef<size_t> shapeIndices) {
           if (index >= static_cast<uint64_t>(maxCandidates.getValue())) {
             exceededLimit = true;
             return false;
@@ -145,19 +164,18 @@ struct EnumerateAnalyticalTaskCandidatesPass
           return true;
         });
     if (!countedAll && exceededLimit) {
-      func.emitError() << "complete concurrently packable shape space exceeds "
+      func.emitError() << "complete task-shape Cartesian product exceeds "
                           "max-candidates="
                        << maxCandidates.getValue()
                        << "; refusing to publish a partial candidate manifest";
       return signalPassFailure();
     }
     if (!countedAll) {
-      func.emitError() << "failed while counting the packable shape space";
+      func.emitError() << "failed while counting the task-shape space";
       return signalPassFailure();
     }
     if (candidateCount == 0) {
-      func.emitError() << "no task shape tuple can fit simultaneously on the "
-                          "physical CGRA grid";
+      func.emitError() << "task-shape Cartesian product is empty";
       return signalPassFailure();
     }
 
@@ -169,8 +187,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
           // architecture YAML hash and each source-task body hash bind this
           // manifest to the exact machine and computation that the predictor
           // and materializer consume. The cost-query list contains exactly
-          // the task/shape pairs referenced by at least one feasible
-          // candidate.
+          // every task/shape pair referenced by the Cartesian product.
           llvm::json::Object architectureRecord;
           architectureRecord["grid_rows"] =
               int64_t{architecture.getMultiCgraRows()};
@@ -208,8 +225,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
           fixedAxes["fusion"] = "identity";
           fixedAxes["fission"] = "factor-1";
           fixedAxes["tiling"] = "factor-1";
-          fixedAxes["placement"] =
-              "exact-fit-required-coordinates-downstream-heuristic";
+          fixedAxes["placement"] = "spatial-temporal-scheduler";
           fixedAxes["temporal_order"] = "downstream-heuristic";
           fixedAxes["communication"] = "not-scored";
           llvm::json::Object budget;
@@ -224,6 +240,10 @@ struct EnumerateAnalyticalTaskCandidatesPass
           header["spatial_capacity_policy"] = kSpatialCapacityPolicy.str();
           header["shape_pruning_policy"] = kShapePruningPolicy.str();
           header["function"] = function;
+          if (!graphVariantId.getValue().empty()) {
+            header["graph_variant_id"] = graphVariantId.getValue();
+            header["graph_variant_sha256"] = graphVariantSha256.getValue();
+          }
           header["architecture"] = std::move(architectureRecord);
           header["max_cgras_per_task"] = effectiveMaxCgrasPerTask;
           header["candidate_budget"] = std::move(budget);
@@ -232,13 +252,11 @@ struct EnumerateAnalyticalTaskCandidatesPass
           header["fixed_axes"] = std::move(fixedAxes);
           writeJsonLine(os, std::move(header));
 
-          // Emits every concurrently packable tuple in task-major shape order.
-          // A tuple is emitted once even if it has multiple legal placements;
-          // placement itself is not a candidate axis yet.
+          // Emits the complete task-major Cartesian product. Placement and
+          // temporal reuse remain scheduler decisions, not candidate axes.
           uint64_t emitted = 0;
-          bool emittedAll = visitConcurrentlyPackableShapeTuples(
-              shapesByTask, packing,
-              [&](uint64_t index, ArrayRef<size_t> shapeIndices) {
+          bool emittedAll = visitShapeCartesianProduct(
+              shapesByTask, [&](uint64_t index, ArrayRef<size_t> shapeIndices) {
                 Candidate candidate;
                 candidate.id = makeSequentialCandidateId(index);
                 for (auto [taskIndex, shapeIndex] :
@@ -258,7 +276,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
           }
 
           // Closes the stream with its record count. The common reader
-          // independently recomputes the exact packable space and every ID.
+          // independently recomputes the exact Cartesian space and every ID.
           llvm::json::Object footer;
           footer["record_type"] = "footer";
           footer["schema"] = kCandidateSchema.str();
@@ -280,9 +298,17 @@ struct EnumerateAnalyticalTaskCandidatesPass
     for (const TaskMetadata &task : *taskMetadata)
       task.op->setAttr(kSourceTaskBodyShaAttr,
                        StringAttr::get(func.getContext(), task.bodySha256));
+    if (!graphVariantId.getValue().empty()) {
+      func->setAttr(
+          "amoeba.graph_variant_id",
+          StringAttr::get(func.getContext(), graphVariantId.getValue()));
+      func->setAttr(
+          "amoeba.graph_variant_sha256",
+          StringAttr::get(func.getContext(), graphVariantSha256.getValue()));
+    }
     llvm::errs() << "[JointScheduling] enumerated all " << candidateCount
-                 << " concurrently packable shape candidates into "
-                 << outputFile.getValue() << "\n";
+                 << " task-shape candidates into " << outputFile.getValue()
+                 << "\n";
   }
 };
 

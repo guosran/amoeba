@@ -7,8 +7,10 @@
 #include "AnalyticalTaskCandidateManifest.h"
 #include "AnalyticalTaskCostCatalog.h"
 
+#include "Backend/Neura/NeuraBackendOptions.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
 
 #include "TaskflowDialect/TaskflowOps.h"
 
@@ -16,7 +18,9 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/SHA256.h"
 
 #include <algorithm>
 #include <cmath>
@@ -28,6 +32,12 @@ using namespace mlir;
 using namespace mlir::amoeba::neura::joint_scheduling;
 
 namespace {
+
+static std::string hashBytes(StringRef bytes) {
+  llvm::SHA256 hasher;
+  hasher.update(bytes);
+  return llvm::toHex(hasher.final(), /*LowerCase=*/true);
+}
 
 struct ScoreAnalyticalTaskCandidatesPass
     : public PassWrapper<ScoreAnalyticalTaskCandidatesPass,
@@ -65,6 +75,18 @@ struct ScoreAnalyticalTaskCandidatesPass
       *this, "top-k",
       llvm::cl::desc("Uses zero to select every valid candidate."),
       llvm::cl::init(1)};
+  Option<std::string> communicationMode{
+      *this, "communication-mode",
+      llvm::cl::desc("Task communication mode: 'none' or 'explicit'."),
+      llvm::cl::init("none")};
+  Option<std::string> graphVariantId{
+      *this, "graph-variant-id",
+      llvm::cl::desc("Optional graph variant identity; requires its SHA-256."),
+      llvm::cl::init("")};
+  Option<std::string> graphVariantSha256{
+      *this, "graph-variant-sha256",
+      llvm::cl::desc("SHA-256 of the exact graph-variant result IR bytes."),
+      llvm::cl::init("")};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -76,6 +98,12 @@ struct ScoreAnalyticalTaskCandidatesPass
       return signalPassFailure();
     }
     func::FuncOp func = *selectedFunction;
+    if (graphVariantId.getValue().empty() !=
+        graphVariantSha256.getValue().empty()) {
+      func.emitError() << "graph-variant-id and graph-variant-sha256 must be "
+                          "provided together";
+      return signalPassFailure();
+    }
     if (candidateFile.getValue().empty() || costFile.getValue().empty() ||
         outputFile.getValue().empty() || topK.getValue() < 0 ||
         samePath(candidateFile.getValue(), outputFile.getValue()) ||
@@ -112,6 +140,20 @@ struct ScoreAnalyticalTaskCandidatesPass
       func.emitError() << error;
       return signalPassFailure();
     }
+    if (communicationMode.getValue() != "none" &&
+        communicationMode.getValue() != "explicit") {
+      func.emitError() << "unknown communication mode: "
+                       << communicationMode.getValue();
+      return signalPassFailure();
+    }
+    const bool communicationAware = communicationMode.getValue() == "explicit";
+    FailureOr<std::optional<InterTaskNetworkSpec>> network =
+        loadInterTaskNetworkSpec(::mlir::amoeba::getNeuraArchitectureSpecFile(),
+                                 /*require_network=*/communicationAware, error);
+    if (failed(network)) {
+      func.emitError() << error;
+      return signalPassFailure();
+    }
 
     // Scores are held until readCandidateManifest has independently proven
     // canonical ordering, exact packing, and a complete footer.
@@ -137,6 +179,11 @@ struct ScoreAnalyticalTaskCandidatesPass
           scoreHeader["cost_catalog_sha256"] = costs.catalogSha256().str();
           scoreHeader["architecture_sha256"] = costs.architectureSha256().str();
           scoreHeader["score_model"] = kScoreModel.str();
+          scoreHeader["communication_mode"] = communicationMode.getValue();
+          if (!graphVariantId.getValue().empty()) {
+            scoreHeader["graph_variant_id"] = graphVariantId.getValue();
+            scoreHeader["graph_variant_sha256"] = graphVariantSha256.getValue();
+          }
           scoreHeader["mapper_success_probability"] =
               costs.mapperSuccessProbabilityRole().str();
           writeJsonLine(os, std::move(scoreHeader));
@@ -236,11 +283,26 @@ struct ScoreAnalyticalTaskCandidatesPass
                   static_cast<int>(manifestHeader.gridRows),
                   static_cast<int>(manifestHeader.gridCols),
                   taskflow::SchedulingMode::SpatialTemporal);
+              std::unique_ptr<InterTaskNetworkCommunicationModel>
+                  communicationModel;
+              if (communicationAware) {
+                FailureOr<TaskEdgeGraph> edgeGraph = buildTaskEdgeGraph(
+                    *clonedFunction,
+                    TaskEdgeGraphOptions{/*require_payload=*/true,
+                                         /*read_control_predecessors=*/true},
+                    consumeError);
+                if (failed(edgeGraph))
+                  return false;
+                communicationModel =
+                    std::make_unique<InterTaskNetworkCommunicationModel>(
+                        std::move(*edgeGraph), **network);
+              }
               taskflow::TaskScheduler scheduler(
                   static_cast<int>(manifestHeader.gridRows),
                   static_cast<int>(manifestHeader.gridCols),
                   taskflow::SchedulingMode::SpatialTemporal,
-                  taskflow::ShapeSelectionPolicy::FixedOrientation);
+                  taskflow::ShapeSelectionPolicy::FixedOrientation,
+                  communicationModel.get());
               if (!scheduler.schedule(
                       *clonedFunction,
                       strategy.computeRoutingCriticalPathPriority(
@@ -258,6 +320,179 @@ struct ScoreAnalyticalTaskCandidatesPass
                 return false;
               }
               score["predicted_scheduler_makespan"] = makespan;
+              llvm::json::Array taskSchedule;
+              std::string traceIdentity;
+              llvm::raw_string_ostream identity(traceIdentity);
+              identity << "joint-schedule-trace-v2\n"
+                       << candidate.id << "\n"
+                       << *architectureSha << "\n"
+                       << communicationMode.getValue() << "\n";
+              for (taskflow::TaskflowTaskOp task : clonedTasks) {
+                auto scheduleEntry = llvm::find_if(
+                    scheduler.getScheduleEntries(), [&](const auto &entry) {
+                      return entry.task == task.getOperation();
+                    });
+                if (scheduleEntry == scheduler.getScheduleEntries().end()) {
+                  consumeError = "scheduler did not emit a complete task trace";
+                  return false;
+                }
+                llvm::json::Object taskRecord;
+                taskRecord["task"] = task.getTaskName().str();
+                taskRecord["start_cycle"] = scheduleEntry->startCycle;
+                taskRecord["end_cycle"] = scheduleEntry->endCycle;
+                identity << "T|" << task.getTaskName().size() << ":"
+                         << task.getTaskName() << "|"
+                         << scheduleEntry->startCycle << "|"
+                         << scheduleEntry->endCycle;
+                llvm::json::Array cells;
+                for (auto [row, col] : scheduleEntry->positions) {
+                  llvm::json::Object cell;
+                  cell["row"] = row;
+                  cell["col"] = col;
+                  identity << "|" << row << "," << col;
+                  cells.push_back(std::move(cell));
+                }
+                identity << "\n";
+                taskRecord["cgra_positions"] = std::move(cells);
+                taskSchedule.push_back(std::move(taskRecord));
+              }
+              llvm::json::Array routes;
+              llvm::json::Array dependencies;
+              if (communicationModel) {
+                for (const TaskEdge &edge :
+                     communicationModel->getTypedEdges()) {
+                  taskflow::TaskflowTaskOp producer = edge.producer;
+                  taskflow::TaskflowTaskOp consumer = edge.consumer;
+                  llvm::json::Object dependency;
+                  dependency["producer"] = producer.getTaskName().str();
+                  dependency["consumer"] = consumer.getTaskName().str();
+                  dependency["kind"] = stringifyTaskEdgeKind(edge.kind).str();
+                  dependency["producer_segment"] =
+                      stringifyTaskResultSegment(edge.producer_segment).str();
+                  dependency["producer_index"] = edge.producer_index;
+                  dependency["consumer_segment"] =
+                      stringifyTaskOperandSegment(edge.consumer_segment).str();
+                  dependency["consumer_index"] = edge.consumer_index;
+                  if (edge.payload_bits)
+                    dependency["payload_bits"] =
+                        static_cast<int64_t>(*edge.payload_bits);
+                  identity << "D|" << producer.getTaskName().size() << ":"
+                           << producer.getTaskName() << "|"
+                           << consumer.getTaskName().size() << ":"
+                           << consumer.getTaskName() << "|"
+                           << stringifyTaskEdgeKind(edge.kind) << "|"
+                           << stringifyTaskResultSegment(edge.producer_segment)
+                           << "|" << edge.producer_index << "|"
+                           << stringifyTaskOperandSegment(edge.consumer_segment)
+                           << "|" << edge.consumer_index << "|";
+                  if (edge.payload_bits)
+                    identity << *edge.payload_bits;
+                  else
+                    identity << "-";
+                  identity << "\n";
+                  dependencies.push_back(std::move(dependency));
+                }
+                for (const auto &transfer :
+                     communicationModel->getCommittedTransfers()) {
+                  llvm::json::Object route;
+                  route["producer"] =
+                      cast<taskflow::TaskflowTaskOp>(transfer.producer)
+                          .getTaskName()
+                          .str();
+                  route["consumer"] =
+                      cast<taskflow::TaskflowTaskOp>(transfer.consumer)
+                          .getTaskName()
+                          .str();
+                  if (transfer.payloadBits >
+                          static_cast<uint64_t>(
+                              std::numeric_limits<int64_t>::max()) ||
+                      transfer.pathLatencyCycles >
+                          static_cast<uint64_t>(
+                              std::numeric_limits<int64_t>::max()) ||
+                      transfer.bottleneckBandwidthBitsPerCycle >
+                          static_cast<uint64_t>(
+                              std::numeric_limits<int64_t>::max()) ||
+                      transfer.transferCycles >
+                          static_cast<uint64_t>(
+                              std::numeric_limits<int64_t>::max())) {
+                    consumeError =
+                        "communication trace value exceeds signed 64-bit";
+                    return false;
+                  }
+                  route["payload_bits"] =
+                      static_cast<int64_t>(transfer.payloadBits);
+                  route["path_latency_cycles"] =
+                      static_cast<int64_t>(transfer.pathLatencyCycles);
+                  route["bottleneck_bandwidth_bits_per_cycle"] =
+                      static_cast<int64_t>(
+                          transfer.bottleneckBandwidthBitsPerCycle);
+                  route["transfer_cycles"] =
+                      static_cast<int64_t>(transfer.transferCycles);
+                  route["ready_cycle"] = transfer.readyCycle;
+                  route["source_row"] = transfer.source.row;
+                  route["source_col"] = transfer.source.column;
+                  route["destination_row"] = transfer.destination.row;
+                  route["destination_col"] = transfer.destination.column;
+                  StringRef producerName =
+                      cast<taskflow::TaskflowTaskOp>(transfer.producer)
+                          .getTaskName();
+                  StringRef consumerName =
+                      cast<taskflow::TaskflowTaskOp>(transfer.consumer)
+                          .getTaskName();
+                  identity << "R|" << producerName.size() << ":" << producerName
+                           << "|" << consumerName.size() << ":" << consumerName
+                           << "|" << transfer.source.row << ","
+                           << transfer.source.column << "|"
+                           << transfer.destination.row << ","
+                           << transfer.destination.column << "|"
+                           << transfer.payloadBits << "|" << transfer.readyCycle
+                           << "|" << transfer.pathLatencyCycles << "|"
+                           << transfer.bottleneckBandwidthBitsPerCycle << "|"
+                           << transfer.transferCycles;
+                  llvm::json::Array edgeIndices;
+                  for (uint32_t edgeIndex : transfer.edgeIndices) {
+                    edgeIndices.push_back(edgeIndex);
+                    identity << "|e" << edgeIndex;
+                  }
+                  route["edge_indices"] = std::move(edgeIndices);
+                  llvm::json::Array links;
+                  for (const auto &interval : transfer.links) {
+                    llvm::json::Object link;
+                    link["start_cycle"] = interval.startCycle;
+                    link["end_cycle"] = interval.endCycle;
+                    if (interval.localChannel) {
+                      link["resource_kind"] = "local_channel";
+                      link["row"] = interval.localCoordinate.row;
+                      link["col"] = interval.localCoordinate.column;
+                      identity << "|c" << interval.localCoordinate.row << ","
+                               << interval.localCoordinate.column << ","
+                               << interval.startCycle << ","
+                               << interval.endCycle;
+                    } else {
+                      link["resource_kind"] = "network_link";
+                      link["link_index"] = interval.linkIndex;
+                      identity << "|l" << interval.linkIndex << ","
+                               << interval.startCycle << ","
+                               << interval.endCycle;
+                    }
+                    links.push_back(std::move(link));
+                  }
+                  identity << "\n";
+                  route["links"] = std::move(links);
+                  routes.push_back(std::move(route));
+                }
+              }
+              llvm::json::Object trace;
+              trace["candidate_id"] = candidate.id;
+              trace["architecture_sha256"] = *architectureSha;
+              trace["communication_mode"] = communicationMode.getValue();
+              trace["task_schedule"] = std::move(taskSchedule);
+              trace["dependencies"] = std::move(dependencies);
+              trace["routes"] = std::move(routes);
+              llvm::json::Value traceValue(std::move(trace));
+              identity.flush();
+              score["schedule_trace_sha256"] = hashBytes(traceIdentity);
+              score["schedule_trace"] = std::move(traceValue);
               ranked.push_back(
                   {candidate.id, manifestIndex, static_cast<double>(makespan)});
               ++validCount;
@@ -275,6 +510,9 @@ struct ScoreAnalyticalTaskCandidatesPass
                                      manifestHeader, manifestFooter, error))
             return false;
           if (manifestHeader.architectureSha256 != costs.architectureSha256() ||
+              manifestHeader.graphVariantId != graphVariantId.getValue() ||
+              manifestHeader.graphVariantSha256 !=
+                  graphVariantSha256.getValue() ||
               scoredCount != manifestFooter.candidateCount) {
             error = "not every frozen candidate was scored under the bound "
                     "architecture";

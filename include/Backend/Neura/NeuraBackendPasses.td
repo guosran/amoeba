@@ -65,7 +65,12 @@ def OrchestrateTasksOnAccelerators
       /*default=*/"\"routing-critical-path\"",
       "Task orchestration strategy: 'routing-critical-path' (default) or "
       "'analytical-based-task-orchestration' (requires a materialized "
-      "joint-scheduling candidate).">];
+      "joint-scheduling candidate).">,
+    Option<
+      "communicationMode", "communication-mode", "std::string",
+      /*default=*/"\"none\"",
+      "Task communication mode: 'none' or strict architecture-level "
+      "'explicit'.">];
   let constructor =
       "::mlir::amoeba::neura::createOrchestrateTasksOnAcceleratorsPass()";
 }
@@ -90,13 +95,12 @@ def AnalyzeRecResMii : Pass<"analyze-rec-res-mii", "ModuleOp"> {
 
 def EnumerateAnalyticalTaskCandidates
     : Pass<"enumerate-analytical-task-candidates", "ModuleOp"> {
-  let summary = "Freeze all concurrently packable static task shapes";
+  let summary = "Freeze the full static task-shape Cartesian product";
   let description = [{
     Enumerates every ordered assignment of fixed-orientation rectangular
-    per-task CGRA shapes that admits a simultaneous, non-overlapping placement
-    on the physical multi-CGRA grid, then writes a JSONL manifest. Exact
-    placement feasibility is checked with backtracking; concrete placement
-    coordinates remain a downstream heuristic choice. Constant counter chains
+    per-task CGRA shapes that individually fit the physical grid, then writes
+    a JSONL manifest. The production spatial-temporal scheduler determines
+    whole-program feasibility and may reuse resources over time. Constant counter chains
     record their exact trip count, while dynamic or unresolved bounds are
     rejected. Counter bounds are read directly from their SSA definitions, so
     this pass does not depend on `classify-task-and-counter`. The pass does not
@@ -115,7 +119,11 @@ def EnumerateAnalyticalTaskCandidates
            "Fail instead of publishing a partial manifest above this count.">,
        Option<"maxCgrasPerTask", "max-cgras-per-task", "int64_t",
               /*default=*/"0",
-              "Largest rectangular physical footprint per task; zero uses the full physical grid.">];
+              "Largest rectangular physical footprint per task; zero uses the full physical grid.">,
+       Option<"graphVariantId", "graph-variant-id", "std::string",
+              /*default=*/"\"\"", "Optional graph variant identity.">,
+       Option<"graphVariantSha256", "graph-variant-sha256", "std::string",
+              /*default=*/"\"\"", "SHA-256 of graph-variant result IR bytes.">];
   let constructor =
       "::mlir::amoeba::neura::createEnumerateAnalyticalTaskCandidatesPass()";
   let dependentDialects = ["mlir::arith::ArithDialect",
@@ -148,6 +156,34 @@ def MaterializeAnalyticalTaskCandidate
                            "mlir::taskflow::TaskflowDialect"];
 }
 
+def MapJointSchedulingTasks
+    : Pass<"map-joint-scheduling-tasks", "ModuleOp"> {
+  let summary = "Map every selected task on its fixed oriented rectangle";
+  let description = [{
+    Runs InsertDataMov and the real Neura mapper independently for every
+    materialized task. The selected per-task mapper rows and columns configure
+    each invocation. Mapping failure, missing kernels, or a mismatched result
+    fails closed. Successfully mapped operations are moved back into the task.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createMapJointSchedulingTasksPass()";
+  let options = [
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Unique Taskflow function selected by the manifest.">,
+    Option<"scoreFile", "scores", "std::string", /*default=*/"\"\"",
+           "Validated score JSONL used to bind startup cycles.">,
+    Option<"candidateId", "candidate-id", "std::string",
+           /*default=*/"\"\"", "Selected candidate ID.">,
+    Option<"expectedTraceSha256", "expected-trace-sha256", "std::string",
+           /*default=*/"\"\"", "Expected selected schedule trace identity.">,
+    Option<"expectedScoreSha256", "expected-score-sha256", "std::string",
+           /*default=*/"\"\"", "SHA-256 of the exact score JSONL bytes.">
+  ];
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::neura::NeuraDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def ScoreAnalyticalTaskCandidates
     : Pass<"score-analytical-task-candidates", "ModuleOp"> {
   let summary = "Score every candidate in a frozen spatial-binding manifest";
@@ -171,7 +207,14 @@ def ScoreAnalyticalTaskCandidates
     Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
            "Path to the score JSONL manifest.">,
     Option<"topK", "top-k", "int64_t", /*default=*/"1",
-           "Candidates to shortlist; zero selects every valid candidate.">
+           "Candidates to shortlist; zero selects every valid candidate.">,
+    Option<"communicationMode", "communication-mode", "std::string",
+           /*default=*/"\"none\"",
+           "Task communication mode: 'none' or strict 'explicit'.">,
+    Option<"graphVariantId", "graph-variant-id", "std::string",
+           /*default=*/"\"\"", "Optional graph variant identity.">,
+    Option<"graphVariantSha256", "graph-variant-sha256", "std::string",
+           /*default=*/"\"\"", "SHA-256 of graph-variant result IR bytes.">
   ];
   let constructor =
       "::mlir::amoeba::neura::createScoreAnalyticalTaskCandidatesPass()";

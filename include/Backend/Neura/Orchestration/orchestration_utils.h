@@ -10,6 +10,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -93,9 +94,38 @@ struct TaskNode;
 // Internal task/memory dependency graph built from one func.func.
 class TaskMemoryGraph;
 
+// Optional strict model for task-level dependencies and routed transfers.
+// Trial reservations let placement compare alternatives without consuming
+// link capacity; the chosen placement is replayed with commit=true.
+class TaskCommunicationModel {
+public:
+  virtual ~TaskCommunicationModel() = default;
+
+  virtual bool
+  getTaskPredecessors(Operation *consumer,
+                      llvm::SmallVectorImpl<Operation *> &predecessors,
+                      std::string &error) const = 0;
+  virtual void resetReservations() = 0;
+  virtual void beginTrial() = 0;
+  virtual void finishTrial(bool commit) = 0;
+  virtual bool getTransferReadyCycle(Operation *producer, Operation *consumer,
+                                     int source_row, int source_col,
+                                     int destination_row, int destination_col,
+                                     int64_t producer_finish, bool reserve,
+                                     int64_t &ready_cycle,
+                                     std::string &error) = 0;
+};
+
 // Caller-provided task priority; higher values are scheduled earlier among
 // tasks whose predecessors have already been placed.
 using TaskPriorityMap = llvm::DenseMap<Operation *, int>;
+
+struct TaskScheduleEntry {
+  Operation *task = nullptr;
+  int64_t startCycle = 0;
+  int64_t endCycle = 0;
+  llvm::SmallVector<std::pair<int, int>> positions;
+};
 
 // Reusable one-shot scheduler/placer for Taskflow task graphs.
 //
@@ -107,7 +137,8 @@ public:
   TaskScheduler(int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
                 SchedulingMode mode = SchedulingMode::SpatialTemporal,
                 ShapeSelectionPolicy shape_selection_policy =
-                    ShapeSelectionPolicy::RotateOrEnumerateShapes);
+                    ShapeSelectionPolicy::RotateOrEnumerateShapes,
+                TaskCommunicationModel *communication_model = nullptr);
 
   // Schedules and places all Taskflow tasks in `func` using the caller-provided
   // task priority map.
@@ -116,6 +147,9 @@ public:
   // Makespan of the placement in predicted cycles. A zero result means that
   // no tasks were placed or the cycle count overflowed the representable range.
   int64_t getScheduleMakespan() const { return schedule_makespan_; }
+  llvm::ArrayRef<TaskScheduleEntry> getScheduleEntries() const {
+    return schedule_entries_;
+  }
 
 private:
   // Returns true if a CGRA grid coordinate is inside the configured grid.
@@ -161,7 +195,10 @@ private:
   int grid_cols_;
   SchedulingMode mode_;
   ShapeSelectionPolicy shape_selection_policy_;
+  TaskCommunicationModel *communication_model_ = nullptr;
   int64_t schedule_makespan_ = 0;
+  std::string communication_error_;
+  llvm::SmallVector<TaskScheduleEntry> schedule_entries_;
   std::vector<std::vector<llvm::SmallVector<std::pair<int64_t, int64_t>, 4>>>
       cgra_occupancy_;
 };
