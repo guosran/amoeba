@@ -7,6 +7,7 @@
 
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 
@@ -54,36 +55,6 @@ struct ProducerResult {
   Value value;
 };
 
-// Follows channels before resolving the task that produced an operand.  A
-// channel is a pure one-input operation, so resolving it does not erase the
-// task result segment or its payload type.  In explicit communication mode a
-// channel must terminate in a task result; treating an external channel as a
-// zero-cost edge would hide an unknown endpoint.
-FailureOr<Value> resolveChannels(Value value, bool require_task_producer,
-                                 std::string &error) {
-  DenseSet<Value> visited;
-  bool crossed_channel = false;
-  while (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
-    crossed_channel = true;
-    if (!visited.insert(value).second) {
-      error = "taskflow.channel chain contains a cycle";
-      return failure();
-    }
-    if (channel.getSource().getType() != value.getType()) {
-      error = "taskflow.channel source and result types do not match";
-      return failure();
-    }
-    value = channel.getSource();
-  }
-  if (crossed_channel && require_task_producer &&
-      !value.getDefiningOp<TaskflowTaskOp>()) {
-    error = "explicit communication mode requires a channel to terminate in "
-            "a task result";
-    return failure();
-  }
-  return value;
-}
-
 std::optional<ProducerResult>
 findProducerResult(Value value, const DenseMap<Operation *, unsigned> &task_ids,
                    std::string &error) {
@@ -118,6 +89,54 @@ findProducerResult(Value value, const DenseMap<Operation *, unsigned> &task_ids,
   if (!result)
     error = "task edge operand references an unclassified task result";
   return result;
+}
+
+LogicalResult
+collectProducerResults(Value value,
+                       const DenseMap<Operation *, unsigned> &taskIds,
+                       bool requireTaskProducer, bool crossedChannel,
+                       SmallVectorImpl<ProducerResult> &results,
+                       DenseSet<Value> &visited, std::string &error) {
+  if (!visited.insert(value).second) {
+    error = "task dependency forwarding graph contains a cycle or duplicate";
+    return failure();
+  }
+  if (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
+    if (channel.getSource().getType() != value.getType()) {
+      error = "taskflow.channel source and result types do not match";
+      return failure();
+    }
+    return collectProducerResults(channel.getSource(), taskIds,
+                                  requireTaskProducer, true, results, visited,
+                                  error);
+  }
+  if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
+    for (Value state : join.getTileStates()) {
+      if (state.getType() != value.getType()) {
+        error = "taskflow.join state and result types do not match";
+        return failure();
+      }
+      if (failed(collectProducerResults(state, taskIds, requireTaskProducer,
+                                        crossedChannel, results, visited,
+                                        error)))
+        return failure();
+    }
+    return success();
+  }
+  std::optional<ProducerResult> producer =
+      findProducerResult(value, taskIds, error);
+  if (!error.empty())
+    return failure();
+  if (producer) {
+    results.push_back(*producer);
+    return success();
+  }
+  if (crossedChannel && requireTaskProducer) {
+    error = "explicit communication mode requires a channel to terminate in "
+            "one or more task results";
+    return failure();
+  }
+  return success();
 }
 
 std::optional<uint64_t> getScalarBitWidth(Type type) {
@@ -158,6 +177,46 @@ std::optional<uint64_t> getTypePayloadBits(Type type) {
                             UINT64_MAX / std::max<uint64_t>(1, *element_width))
     return std::nullopt;
   return static_cast<uint64_t>(element_count) * *element_width;
+}
+
+std::optional<int64_t> constantIndex(Value value) {
+  if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+    return constant.value();
+  return std::nullopt;
+}
+
+std::optional<uint64_t> getProducerPayloadBits(ProducerResult producer) {
+  auto shaped = dyn_cast<ShapedType>(producer.value.getType());
+  if (!shaped || producer.segment != TaskResultSegment::DoneWrites)
+    return getTypePayloadBits(producer.value.getType());
+  if (!shaped.hasStaticShape())
+    return std::nullopt;
+
+  SmallVector<TaskflowCounterOp> counters;
+  for (Operation &operation : producer.task.getBody().front())
+    if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
+      counters.push_back(counter);
+  if (counters.size() != static_cast<size_t>(shaped.getRank()))
+    return getTypePayloadBits(producer.value.getType());
+
+  uint64_t elements = 1;
+  for (auto [axis, counter] : llvm::enumerate(counters)) {
+    std::optional<int64_t> lower = constantIndex(counter.getLowerBound());
+    std::optional<int64_t> upper = constantIndex(counter.getUpperBound());
+    std::optional<int64_t> step = constantIndex(counter.getStep());
+    if (!lower || !upper || !step || *step != 1 || *lower < 0 ||
+        *upper <= *lower || *upper > shaped.getShape()[axis])
+      return std::nullopt;
+    uint64_t extent = static_cast<uint64_t>(*upper - *lower);
+    if (elements > UINT64_MAX / extent)
+      return std::nullopt;
+    elements *= extent;
+  }
+  std::optional<uint64_t> elementBits =
+      getTypePayloadBits(shaped.getElementType());
+  if (!elementBits || elements > UINT64_MAX / *elementBits)
+    return std::nullopt;
+  return elements * *elementBits;
 }
 
 std::optional<uint64_t> getExplicitPayloadBits(TaskflowTaskOp consumer,
@@ -328,58 +387,88 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
                              TaskOperandSegment operand_segment,
                              TaskEdgeKind expected_kind) -> bool {
     for (auto indexed : llvm::enumerate(values)) {
-      FailureOr<Value> resolved =
-          resolveChannels(indexed.value(), options.require_payload, error);
-      if (failed(resolved))
+      SmallVector<ProducerResult> producers;
+      DenseSet<Value> visited;
+      if (failed(collectProducerResults(
+              indexed.value(), task_ids, options.require_payload,
+              /*crossedChannel=*/false, producers, visited, error)))
         return false;
-      std::optional<ProducerResult> producer =
-          findProducerResult(*resolved, task_ids, error);
-      if (!error.empty())
-        return false;
-      if (!producer)
+      if (producers.empty())
         continue;
 
-      TaskEdgeKind kind = expected_kind;
-      if (operand_segment == TaskOperandSegment::WillReads &&
-          producer->segment != TaskResultSegment::DoneWrites) {
-        error = "will_reads operand must resolve to a done_writes result";
-        return false;
-      }
-      if (operand_segment == TaskOperandSegment::WillWrites) {
-        if (producer->segment == TaskResultSegment::DoneReads)
-          kind = TaskEdgeKind::War;
-        else if (producer->segment == TaskResultSegment::DoneWrites)
-          kind = TaskEdgeKind::Waw;
-        else {
-          error = "will_writes operand must resolve to a done_reads or "
-                  "done_writes result";
+      struct ResolvedEdge {
+        ProducerResult producer;
+        TaskEdgeKind kind;
+        std::optional<uint64_t> payload;
+      };
+      SmallVector<ResolvedEdge> resolvedEdges;
+      uint64_t inferredPayloadSum = 0;
+      bool completePayload = true;
+      bool hasDataEdge = false;
+      for (ProducerResult producer : producers) {
+        TaskEdgeKind kind = expected_kind;
+        if (operand_segment == TaskOperandSegment::WillReads &&
+            producer.segment != TaskResultSegment::DoneWrites) {
+          error = "will_reads operand must resolve to done_writes results";
           return false;
         }
-      }
-      if (operand_segment == TaskOperandSegment::ValueInputs &&
-          producer->segment != TaskResultSegment::ValueOutputs) {
-        error = "value_inputs operand must resolve to a value_outputs result";
-        return false;
+        if (operand_segment == TaskOperandSegment::WillWrites) {
+          if (producer.segment == TaskResultSegment::DoneReads)
+            kind = TaskEdgeKind::War;
+          else if (producer.segment == TaskResultSegment::DoneWrites)
+            kind = TaskEdgeKind::Waw;
+          else {
+            error = "will_writes operand must resolve to done_reads or "
+                    "done_writes results";
+            return false;
+          }
+        }
+        if (operand_segment == TaskOperandSegment::ValueInputs &&
+            producer.segment != TaskResultSegment::ValueOutputs) {
+          error = "value_inputs operand must resolve to value_outputs results";
+          return false;
+        }
+        std::optional<uint64_t> payload;
+        if (kind == TaskEdgeKind::Value || kind == TaskEdgeKind::Raw) {
+          hasDataEdge = true;
+          payload = getProducerPayloadBits(producer);
+          if (!payload)
+            completePayload = false;
+          else if (*payload > UINT64_MAX - inferredPayloadSum) {
+            error = "joined task payload sum overflows unsigned 64-bit bits";
+            return false;
+          } else {
+            inferredPayloadSum += *payload;
+          }
+        }
+        resolvedEdges.push_back({producer, kind, payload});
       }
 
-      std::optional<uint64_t> payload;
-      if (kind == TaskEdgeKind::Value || kind == TaskEdgeKind::Raw) {
-        payload = getStaticPayloadBits(producer->value.getType());
-        std::optional<uint64_t> explicit_payload = getExplicitPayloadBits(
-            consumer, operand_segment, indexed.index(), error);
-        if (!error.empty())
-          return false;
-        if (explicit_payload && payload && *explicit_payload != *payload) {
-          error = "amoeba.edge_payload_bits disagrees with the static "
-                  "payload type";
+      std::optional<uint64_t> explicitPayload;
+      if (hasDataEdge)
+        explicitPayload = getExplicitPayloadBits(consumer, operand_segment,
+                                                 indexed.index(), error);
+      if (!error.empty())
+        return false;
+      if (explicitPayload) {
+        if (resolvedEdges.size() == 1) {
+          if (resolvedEdges.front().payload &&
+              *resolvedEdges.front().payload != *explicitPayload) {
+            error = "amoeba.edge_payload_bits disagrees with the static "
+                    "payload type or transferred region";
+            return false;
+          }
+          resolvedEdges.front().payload = explicitPayload;
+        } else if (!completePayload || inferredPayloadSum != *explicitPayload) {
+          error = "amoeba.edge_payload_bits cannot be partitioned across "
+                  "taskflow.join producers";
           return false;
         }
-        if (explicit_payload)
-          payload = explicit_payload;
       }
-      if (!addEdge(*producer, consumer, kind, operand_segment, indexed.index(),
-                   payload))
-        return false;
+      for (const ResolvedEdge &resolved : resolvedEdges)
+        if (!addEdge(resolved.producer, consumer, resolved.kind,
+                     operand_segment, indexed.index(), resolved.payload))
+          return false;
     }
     return true;
   };

@@ -267,6 +267,73 @@ module {
                 "dynamic payload without an explicit bit count fails closed");
 }
 
+bool testJoinExpandsTypedRegionEdges() {
+  DialectRegistry registry;
+  registry.insert<arith::ArithDialect, func::FuncDialect, TaskflowDialect>();
+  MLIRContext context(registry);
+  constexpr StringLiteral source = R"mlir(
+module {
+  func.func @joined(%output: memref<4x2xi8>) {
+    %left = taskflow.task @left will_writes(%output : memref<4x2xi8>)
+        [original_write_memrefs(%output : memref<4x2xi8>)]
+        : (memref<4x2xi8>) -> (memref<4x2xi8>) {
+    ^bb0(%write: memref<4x2xi8>):
+      %c0 = arith.constant 0 : index
+      %c2 = arith.constant 2 : index
+      %c1 = arith.constant 1 : index
+      %i = taskflow.counter from %c0 to %c2 step %c1 : index
+      %j = taskflow.counter parent(%i : index) from %c0 to %c2 step %c1 : index
+      taskflow.yield done_writes(%write : memref<4x2xi8>)
+    }
+    %right = taskflow.task @right will_writes(%output : memref<4x2xi8>)
+        [original_write_memrefs(%output : memref<4x2xi8>)]
+        : (memref<4x2xi8>) -> (memref<4x2xi8>) {
+    ^bb0(%write: memref<4x2xi8>):
+      %c2 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %i = taskflow.counter from %c2 to %c4 step %c1 : index
+      %j = taskflow.counter parent(%i : index) from %c0 to %c2 step %c1 : index
+      taskflow.yield done_writes(%write : memref<4x2xi8>)
+    }
+    %joined = taskflow.join states(%left, %right) base(%output) axis(0)
+        region([0, 0], [4, 2]) : memref<4x2xi8>
+    taskflow.task @consumer will_reads(%joined : memref<4x2xi8>)
+        [original_read_memrefs(%output : memref<4x2xi8>)]
+        : (memref<4x2xi8>) -> () {
+    ^bb0(%read: memref<4x2xi8>):
+      taskflow.yield
+    }
+    return
+  }
+}
+)mlir";
+  OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(source, &context);
+  if (!expect(static_cast<bool>(module), "joined-region module parses"))
+    return false;
+  std::string error;
+  TaskEdgeGraphOptions options;
+  options.require_payload = true;
+  FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
+      module->lookupSymbol<func::FuncOp>("joined"), options, error);
+  if (!expect(succeeded(graph), "taskflow.join expands to typed producers")) {
+    llvm::errs() << error << "\n";
+    return false;
+  }
+  unsigned rawEdges = 0;
+  for (const TaskEdge &edge : graph->getEdges()) {
+    if (edge.kind != TaskEdgeKind::Raw)
+      continue;
+    ++rawEdges;
+    if (!expect(edge.payload_bits && *edge.payload_bits == 32,
+                "each tile edge carries its exact counter-domain region"))
+      return false;
+  }
+  return expect(rawEdges == 2,
+                "joined consumer depends on every disjoint tile producer");
+}
+
 } // namespace
 
 int main() {
@@ -274,6 +341,7 @@ int main() {
   success &= testBitContractAndBottleneckOnce();
   success &= testTypedEdgesAndReservations();
   success &= testDynamicPayloadFailsClosed();
+  success &= testJoinExpandsTypedRegionEdges();
   if (success)
     llvm::outs() << "Joint scheduling runtime contract tests passed\n";
   return success ? 0 : 1;
