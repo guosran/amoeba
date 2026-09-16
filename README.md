@@ -178,38 +178,54 @@ and `--neura-latency-spec`.
 
 ## Joint scheduling and resource binding
 
-`tools/run-joint-scheduling.py` connects Amoeba's spatial-binding candidate
-passes to the pinned II predictor. It freezes the complete concurrently
-packable static rectangle set in C++, extracts one pre-mapper Neura DFG per
-task, produces one provenance-bound cost per task and oriented mapper shape,
-scores every candidate with the production scheduler, and invokes the
-forwarded real pipeline only for deterministic top-k entries.
+`tools/run-joint-program.py` is the production whole-program entry point. It
+enumerates semantically witnessed task graphs reachable by bounded fusion,
+fission, and tiling sequences; prepares every graph under one versioned pass
+contract; forms the complete task-shape Cartesian product; checks the global
+candidate budget before prediction; scores the union with the production
+spatial-temporal scheduler; and invokes the native mapper only for the global
+top-1.
 
 ```bash
-./tools/run-joint-scheduling.py prepared-taskflow.mlir \
-  --architecture test/archspec/architecture.yaml \
-  --top-k 1 \
-  --output-dir /tmp/amoeba-joint-scheduling \
-  -- \
-  '--orchestrate-tasks-on-accelerators=orchestration-strategy=analytical-based-task-orchestration scheduling-mode=spatial-temporal'
+./tools/run-joint-program.py task-graph.mlir \
+  --architecture test/archspec/architecture_4x4.yaml \
+  --amoeba-opt build/tools/mlir-amoeba-opt/mlir-amoeba-opt \
+  --output-dir /tmp/amoeba-joint-program \
+  --workload-domain static_tensor \
+  --predictor-checkpoint /path/to/reviewed/checkpoint.json \
+  --witness-command 'python3 verify_semantics.py {source} {candidate}'
 ```
 
-The input must already contain Taskflow tasks with one pre-mapper Neura kernel
-per task. Everything after `--` runs once per validated shortlist entry. The
-Python code consumes the candidate manifest and its declared cost queries; it
-does not enumerate candidates. C++ validates the full candidate space before
-publishing the shortlist.
+The input is graph-search-phase Taskflow IR: each compute task has a static
+counter chain and one hyperblock. Every rewritten graph must pass structural
+verification and the caller-supplied semantic witness. Unsupported graph
+shapes fail closed instead of being treated as verified. The exact preparation
+pipeline then produces one pre-mapper Neura kernel per compute task;
+`taskflow.join` remains a non-compute completion barrier.
 
-The current ranking objective is predicted spatial-temporal scheduler
-makespan. Each task duration is
+For each graph, every task independently receives all legal fixed-orientation
+rectangles. A 4 by 4 physical fabric therefore exposes all 16 shapes per task.
+The search does not require all selected rectangles to fit simultaneously:
+half-open temporal schedules may reuse physical resources. The default
+`--max-cgras-per-task 0` means the whole physical grid. Per-graph and global
+candidate bounds are fail-before-publish limits, not pruning heuristics.
+
+The ranking objective is predicted spatial-temporal scheduler makespan. Each
+task duration is
 `startup_cycles + predicted_ii * (trip_count - 1)`; the scorer rounds it up to
-whole cycles and runs the same
-fixed-orientation scheduler and task priority used for materialization.
-Enumeration requires concrete trip counts and rectangular shapes. The default
-`--max-cgras-per-task 0` considers the whole physical grid, and the enumerator
-keeps every legal fixed-orientation rectangle in that range. Communication
-volume, fusion, fission, and tiling are not candidate axes in this spatial
-search.
+whole cycles and uses checked signed 64-bit event time. Ranking ties are broken
+by graph-manifest index and then candidate-manifest index. The selected graph,
+oriented task footprints, placement, routes, and predicted trace are retained;
+after task-local native mapping, the same binder emits a distinct realized
+trace and makespan.
+
+With `--communication-mode explicit`, the architecture must define a versioned
+`inter_task_network`. Data edges carry exact static payload bits and reserve a
+deterministically selected load-aware path. Transfer cost is path latency plus
+the ceiling of payload bits divided by bottleneck bandwidth, applied once.
+Value/RAW, WAR, WAW, channel, and control dependencies remain distinct;
+control-only edges do not invent payloads. `--communication-mode none` retains
+precedence without charging transfers.
 
 The pipeline artifacts carry explicit SHA-256 provenance. `candidate_manifest_sha256`
 is the hash of the exact candidate JSONL bytes, so a cost catalogue cannot be
@@ -228,27 +244,28 @@ repeats the candidate, architecture, and exact cost-catalogue hashes so the
 driver can verify the complete chain immediately before materializing a
 shortlist.
 
-This implementation intentionally covers only the status marked implemented
-or pending review in the joint-scheduling presentation: shared task metadata,
-static trip counts, complete fixed-orientation rectangular shape enumeration,
-fail-closed manifests, exact materialization, predictor integration, and
-scheduler-makespan ranking. General fusion/fission/tiling variant enumeration,
-communication binding, and transformed-graph temporal lowering remain planned;
-they are not represented as completed capabilities by this driver.
+The pinned reference model implements 156 standardized features and the
+`156 -> 64 -> 32 -> 1` GELU network with 12,161 parameters. Its safe data-only
+checkpoint contract covers all 16 oriented 4 by 4 physical-fabric rectangles.
+The checked-in real checkpoint is still provisional: its available evidence is
+800 successful rows from 50 mapper-visible DFGs, not the presentation's
+historical 1,152 rows and 56 DFGs. It therefore requires
+`--allow-provisional-checkpoint`; the deterministic fixture separately requires
+`--allow-test-fixture` and makes no quality claim. Mapper failures and timeouts
+remain censored rather than numeric labels.
 
-The pinned predictor integration is explicitly **pending review**. Its current
-checkpoint contract does not implement the presentation's 156→64→32→1
-reference MLP or the complete set of 16 oriented rectangles on a 4×4 grid.
-The adapter rejects architectures and shapes outside its declared training
-contract; such rejections are censored records, never numeric costs. Do not
-treat the current FIR smoke test or `candidate-0` replay as 4×4 model
-validation.
+`tools/run-joint-scheduling.py` remains available as a lower-level,
+single-graph diagnostic driver for already prepared Taskflow/Neura IR. It is
+not the whole-program graph-search entry point.
 
-The current Neura mapper accepts one module-level array size rather than one
-size per Taskflow task. The driver therefore refuses to invoke it when a
-shortlisted candidate contains any multi-CGRA task; silently mapping such a
-candidate on the default array would not be a valid replay. The JSON report
-separately records predictor, resource-binding, and full-mapper status.
+Current graph-rewrite support deliberately fails closed outside its reviewed
+static tensor subset. Tiling requires identity-layout memrefs, an alias proof
+for function arguments, and one output memref per task. Dynamic domains,
+ambiguous effects or payloads, and unsupported control annotations are
+rejected. See [the implementation contract](JOINT_SCHEDULING_CONTRACT.md),
+[the review report](JOINT_SCHEDULING_REVIEW.md), and
+[the graph-space notes](tools/joint_graph_variant_space.md) for the exact
+boundary.
 
 ## Tests
 

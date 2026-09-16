@@ -1,96 +1,99 @@
 # Joint Scheduling and Resource Binding Review
 
-This checkout is reviewed against
+This checkout was reviewed against
 `/home/x/shiran/project/amoeba/docs/presentations/amoeba_joint_scheduling_resource_binding_15slides.tex`.
-It deliberately starts from the clean spatial-shape plus ML-ranking stack at
-commit `46f2c9a0af7b324c536d0c700f2cbeecaee60a69`. The later aggregate delivery
-was not used as a source baseline because it mixes incomplete future work with
-generated evidence and does not form a standalone Git checkout.
+The public vocabulary is joint scheduling and resource binding. Retired search
+terminology is absent from project-owned source, tests, tools, targets, and
+documentation.
 
-## Scope represented by this checkout
+## Review result
 
-Implemented:
+The production path now implements the presentation's search and replay
+contract for its declared static tensor subset:
 
-- shared task metadata and static trip-count inference;
-- complete fixed-orientation rectangular shapes for the configured grid;
-- deterministic, provenance-bound, fail-closed candidate manifests;
-- exact candidate materialization with stale derived state removed;
-- 64-bit event-based spatial-temporal scheduling and makespan reporting;
-- deterministic shortlist ordering and top-entry replay.
+- bounded breadth-first fusion, fission, and tiling sequences, with legal
+  actions recomputed after every rewrite and structurally equal graphs
+  deduplicated;
+- direct producer-consumer and sibling fusion legality checks;
+- predecessor-closed fission cuts with recurrence, memory-order, effect, and
+  live-value checks;
+- static tensor tiling across axes and factors, including remainder coverage,
+  cross-tile completion joins, and repeated fission/tiling sequences;
+- all oriented rectangular shapes per task, including all 16 on a 4 by 4
+  physical grid, without simultaneous-fit pruning;
+- typed value/RAW, WAR, WAW, channel, and control dependencies;
+- exact static payloads, deterministic load-aware paths, shared-link
+  reservations, and checked transfer-cycle arithmetic;
+- signed 64-bit event scheduling, half-open task intervals, resource reuse,
+  fixed-orientation placement, and whole-program makespan scoring;
+- the 156-feature, `156 -> 64 -> 32 -> 1` GELU predictor with 12,161 parameters,
+  safe data-only checkpoints, all 16 oriented shapes, and censored failures;
+- provenance-bound graph, candidate, cost, score, predicted-trace, and
+  realized-trace artifacts;
+- deterministic global ranking across every graph and shape tuple, followed by
+  exactly one task-local native mapper and binder replay for the global top-1;
+- transactional publication: graph, candidate, global-budget, prediction, or
+  replay failure publishes no result directory.
 
-Pending review:
+The production entry point is `tools/run-joint-program.py`. The older
+`tools/run-joint-scheduling.py` is retained only as a single-graph diagnostic
+pipeline.
 
-- ML task-shape cost prediction and its applicability contract;
-- production-quality 4×4 model coverage;
-- agreement between predictor, scheduler, and final replay.
+## Fail-closed support boundary
 
-Planned and intentionally not claimed as implemented:
+The implementation does not silently generalize beyond the reviewed domain.
 
-- general fusion, fission, and tensor-tiling graph variants;
-- communication edges, link binding, and transfer-cycle costs;
-- transformed-graph temporal lowering and repeated rewrite search.
+- Graph search accepts one static Taskflow counter chain and one hyperblock per
+  compute task. Another compiler phase is rejected.
+- Tiling currently requires static identity-layout memrefs and one output
+  memref. Function arguments require an explicit no-alias proof. Multi-output,
+  dynamic, or ambiguous cases are rejected.
+- Fission materializes static counter-indexed cut tensors and rejects unsafe
+  recurrences, effects, ordering, or unsupported live values.
+- Explicit communication requires a versioned `inter_task_network` in the
+  architecture. Dynamic or ambiguous payloads are rejected.
+- Rewritten graphs require an external semantic witness. The framework records
+  its command template and hashes, but the workload-specific equivalence oracle
+  is intentionally not fabricated inside the compiler.
 
-## Corrections made in this review
+These restrictions reduce the accepted input set; they do not weaken the
+invariants for accepted candidates.
 
-- Removed the retired terminology from project-owned paths, namespaces,
-  targets, logs, tests, documentation, and the public driver name.
-- Added an explicit manifest budget contract and retained atomic publication.
-- Changed scheduling from scaled integer stepping to exact 64-bit ready and
-  resource-release events.
-- Made task dependencies visible through `taskflow.channel` chains.
-- Rejects unknown scheduling modes instead of silently selecting a mode.
-- Rejects non-converged fixed-shape placement instead of ranking an arbitrary
-  iteration.
-- Clears stale placement and profile attributes before materializing a new
-  candidate.
-- Requires unsupported predictor records to be censored rather than carrying
-  numeric timing values.
-- Fixed function selection so the driver no longer passes an unsupported
-  extractor option; selected task names must be globally unique.
+## Evidence status
 
-## Blocking gaps before a full presentation-level claim
+The reference model architecture and serving contract match the presentation,
+but model-quality promotion is not claimed. The available real checkpoint has
+800 successful rows from 50 distinct mapper-visible DFGs. The presentation's
+historical 1,152-row, 56-DFG corpus is not present with reproducible manifests
+and weights, so the real checkpoint remains provisional and is rejected unless
+explicitly enabled. The zero-quality checkpoint is an adapter fixture only.
 
-1. The pinned predictor permits only its recorded 1×1 architecture identity,
-   while the physical candidate flow is intended for a 4×4 multi-CGRA grid.
-2. Its deployed ensemble is not the presentation's 156→64→32→1 reference MLP.
-3. Its protocol covers only eight task shapes (up to four physical CGRAs), not
-   all 16 oriented rectangles on a 4×4 grid.
-4. The current spatial candidate producer requires simultaneous packing. It
-   therefore cannot represent tuples that become legal only through temporal
-   reuse; that capability belongs to the planned temporal extension.
-5. Model applicability is not yet bound to an explicit tensor-operation
-   contract. The current driver must remain marked pending review.
-6. The predictor adapter's public `--checkpoint` path uses unsafe pickle-based
-   loading. The outer driver does not expose that option, but the adapter must
-   move to weights-only loading or a data-only checkpoint format.
-7. Communication-aware placement and timing are absent by design in this
-   foundation and must not be inferred from scheduler makespan alone.
-8. The current mapper takes one module-level array size and cannot honor
-   different selected shapes for different Taskflow tasks. The driver now
-   fails closed for multi-CGRA mapper replay; a per-task mapping bridge remains
-   required.
-
-The smoke test using a single candidate proves the artifact pipeline, not
-general 4×4 model quality. A release claim requires a validated checkpoint and
-an end-to-end test that enumerates multiple 4×4 candidates, ranks them, replays
-the top entry, and compares the predicted schedule with the final mapping.
+The repository also does not yet contain the presentation's complete Attention
+and SimpleResNet predicted-versus-oracle study. Consequently, task-level held-
+out error, shape-ranking quality, whole-program makespan regret, and mapper-time
+reduction remain experimental evidence gaps rather than implementation claims.
 
 ## Verification performed
 
-- `mlir-amoeba-opt` configured and built successfully in a fresh build tree.
-- Nine focused joint-scheduling/orchestration lit tests pass, including the
-  new event-time, channel-dependency, stale-state, censored-cost, budget, and
-  invalid-mode checks.
-- The real-checkpoint FIR single-CGRA replay test passes and reports the mapper
-  and binding status explicitly.
-- All 25 tests that do not require the optional symbol-generation environment
-  or the long-running ResNet mapper pass, plus one unsupported test, complete
-  without failure.
-- `git diff --check`, LLVM C++ formatting checks, Python syntax checks, and the
-  retired-terminology source scan pass.
+- The merged C++/MLIR targets build successfully in a fresh review build.
+- The joint-scheduling lit directory passes 19 of 19 tests.
+- The runtime contract executable passes, including typed edges, joins,
+  transfer accounting, link reservations, temporal reuse, and overflow checks.
+- The real task-local mapping bridge test passes.
+- Graph-space and global-ranking Python tests pass 7 of 7.
+- Predictor and adapter tests pass 35 of 35.
+- A real two-task whole-program smoke run scores the full 16 by 16 shape
+  product, then performs one native mapper replay. It reports predicted
+  makespan 73 and realized makespan 45 with distinct trace hashes.
+- A real one-rewrite search carries all 13 discovered graph variants through
+  preparation, fixture inference, global ranking, and one mapper replay; a
+  transformed graph wins the deterministic global ranking.
+- An explicit-communication smoke run derives a 640-bit RAW transfer, reserves
+  the local channel for 20 cycles at 32 bits per cycle, and reports predicted
+  makespan 93 and realized makespan 65.
+- Python syntax, `git diff --check`, C++ formatting, and the retired-term scan
+  pass after generated caches are removed.
 
-The five symbol-generated tests require a Python environment with
-`torch-mlir`; the default interpreter does not provide it. The standalone
-ResNet test remains dominated by the known unbounded mapper-backtracking path
-and was stopped rather than reported as passed. These are not counted in the
-successful test totals above.
+The smoke run validates integration and replay, not prediction quality. The
+provisional evidence gate above remains the honest blocker to an empirical
+quality claim.

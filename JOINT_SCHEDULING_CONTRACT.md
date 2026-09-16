@@ -44,6 +44,12 @@ A transformed graph is publishable only after its structural verifier and
 semantic witness succeed.  Tool failure, timeout, or an absent witness is a
 rejection, not an unverified success.
 
+The reviewed implementation accepts graph-search-phase tasks with static
+counter chains and one hyperblock.  Tiling currently requires static
+identity-layout memrefs, an alias proof for function arguments, and one output
+memref.  Inputs outside that subset fail closed; they are not silently omitted
+from an otherwise complete search.
+
 ## Shapes and resource binding
 
 On an `R x C` physical multi-CGRA fabric, each task independently receives
@@ -104,9 +110,11 @@ structurally correct fixture model is not a promoted checkpoint.
 
 Every legal candidate is scored under the same predictor, placement,
 communication, and temporal contracts.  Ranking is deterministic by
-predicted makespan followed by canonical candidate index.  The production
-driver invokes the complete native lowering and mapper only for top-1 by
-default.
+predicted makespan, graph-manifest index, and candidate-manifest index.  The
+global candidate budget is checked across every graph variant before any
+predictor invocation.  The production driver invokes the complete native
+lowering, task-local mapper, and resource binder exactly once for the global
+top-1.
 
 Replay must preserve the selected graph variant, task-local oriented shapes,
 and mapper footprints.  Those are binding decisions, so any mismatch fails the
