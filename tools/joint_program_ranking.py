@@ -169,12 +169,20 @@ def load_graph_variants(path: Path) -> Tuple[Mapping[str, Any], List[GraphVarian
     return header, variants
 
 
-def _load_candidates(path: Path) -> Tuple[Mapping[str, Any], List[str]]:
+def _load_candidates(
+    path: Path, graph: GraphVariant
+) -> Tuple[Mapping[str, Any], List[str]]:
     records = _records(path, CANDIDATE_SCHEMA)
     if records[0].get("record_type") != "header" or records[-1].get(
         "record_type"
     ) != "footer":
         raise RankingError("candidate manifest is missing header/footer")
+    header = records[0]
+    if (
+        header.get("graph_variant_id") != graph.graph_variant_id
+        or header.get("graph_variant_sha256") != graph.ir_sha256
+    ):
+        raise RankingError("candidate manifest does not match its graph variant")
     candidates: List[str] = []
     for record in records[1:-1]:
         if record.get("record_type") != "candidate":
@@ -185,7 +193,7 @@ def _load_candidates(path: Path) -> Tuple[Mapping[str, Any], List[str]]:
         candidates.append(candidate_id)
     if records[-1].get("candidate_count") != len(candidates):
         raise RankingError("candidate manifest is incomplete")
-    return records[0], candidates
+    return header, candidates
 
 
 def _load_cost(path: Path) -> Mapping[str, Any]:
@@ -205,10 +213,11 @@ def _load_scores(
     path: Path,
     candidates_path: Path,
     costs_path: Path,
+    graph: GraphVariant,
     architecture_sha256: str,
     communication_mode: str,
 ) -> Tuple[Mapping[str, Any], List[Mapping[str, Any]]]:
-    candidate_header, candidate_ids = _load_candidates(candidates_path)
+    candidate_header, candidate_ids = _load_candidates(candidates_path, graph)
     costs = _load_cost(costs_path)
     records = _records(path, SCORE_SCHEMA)
     if records[0].get("record_type") != "header" or records[-1].get(
@@ -229,6 +238,8 @@ def _load_scores(
         or candidate_architecture.get("spec_sha256") != architecture_sha256
         or header.get("communication_mode") != communication_mode
         or header.get("function") != candidate_header.get("function")
+        or header.get("graph_variant_id") != graph.graph_variant_id
+        or header.get("graph_variant_sha256") != graph.ir_sha256
     ):
         raise RankingError("score provenance does not match variant artifacts")
     scores: List[Mapping[str, Any]] = []
@@ -269,20 +280,29 @@ def build_global_ranking(
     if [item.graph for item in variant_artifacts] != variants:
         raise RankingError("variant artifacts must cover graph order exactly")
     architecture_sha = sha256_file(architecture)
+    candidate_spaces: List[Tuple[VariantArtifacts, List[str]]] = []
+    total_candidates = 0
+    for item in variant_artifacts:
+        _, candidate_ids = _load_candidates(item.candidates, item.graph)
+        total_candidates += len(candidate_ids)
+        candidate_spaces.append((item, candidate_ids))
+    if total_candidates > max_total_candidates:
+        raise RankingError(
+            "total candidate budget exceeded before score validation"
+        )
+
     ranked: List[Tuple[int, int, int, Dict[str, Any]]] = []
     artifact_rows = []
-    total_candidates = 0
     valid_candidates = 0
-    for item in variant_artifacts:
-        _, candidate_ids = _load_candidates(item.candidates)
+    for item, candidate_ids in candidate_spaces:
         _, scores = _load_scores(
             item.scores,
             item.candidates,
             item.costs,
+            item.graph,
             architecture_sha,
             communication_mode,
         )
-        total_candidates += len(candidate_ids)
         artifact_rows.append(
             {
                 "graph_variant_id": item.graph.graph_variant_id,
@@ -331,10 +351,6 @@ def build_global_ranking(
                 )
             )
             valid_candidates += 1
-    if total_candidates > max_total_candidates:
-        raise RankingError(
-            "total candidate budget exceeded before global publication"
-        )
     if not ranked:
         raise RankingError("no valid whole-program candidate")
     ranked.sort(key=lambda value: value[:3])

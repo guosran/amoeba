@@ -108,6 +108,8 @@ class JointProgramRankingTest(unittest.TestCase):
                     "schema": CANDIDATE_SCHEMA,
                     "record_type": "header",
                     "function": "main",
+                    "graph_variant_id": graph.graph_variant_id,
+                    "graph_variant_sha256": graph.ir_sha256,
                     "architecture": {"spec_sha256": sha256_file(architecture)},
                 },
                 *[
@@ -144,6 +146,8 @@ class JointProgramRankingTest(unittest.TestCase):
                     "architecture_sha256": sha256_file(architecture),
                     "communication_mode": "explicit",
                     "function": "main",
+                    "graph_variant_id": graph.graph_variant_id,
+                    "graph_variant_sha256": graph.ir_sha256,
                 },
                 *[
                     {
@@ -221,6 +225,25 @@ class JointProgramRankingTest(unittest.TestCase):
                 )
                 write_global_ranking(output, ranking)
             self.assertFalse(output.exists())
+
+    def test_graph_provenance_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="joint-ranking-graph-id-") as raw:
+            root = Path(raw)
+            graph_manifest, architecture, graphs = self._space(root)
+            artifacts = [
+                self._variant_artifacts(root, architecture, graphs[0], [7]),
+                self._variant_artifacts(root, architecture, graphs[1], [8]),
+            ]
+            records = [
+                json.loads(line)
+                for line in artifacts[1].scores.read_text(encoding="utf-8").splitlines()
+            ]
+            records[0]["graph_variant_id"] = graphs[0].graph_variant_id
+            _write_jsonl(artifacts[1].scores, records)
+            with self.assertRaisesRegex(RankingError, "provenance"):
+                build_global_ranking(
+                    graph_manifest, architecture, artifacts, "explicit", 1, 2
+                )
 
 
 if __name__ == "__main__":
