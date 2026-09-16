@@ -146,7 +146,8 @@ def _run(command: Sequence[str], label: str, output: Path,
 
 
 def _task_dfg_arguments(index: Mapping[str, object],
-                        expected_tasks: Sequence[str]) -> List[str]:
+                        expected_tasks: Sequence[str],
+                        index_path: Path) -> List[str]:
     result: List[str] = []
     if len(set(expected_tasks)) != len(expected_tasks):
         raise PipelineError("selected function has duplicate task names")
@@ -156,7 +157,10 @@ def _task_dfg_arguments(index: Mapping[str, object],
             raise PipelineError(
                 f"DFG extraction did not produce selected task {task}"
             )
-        path = _require_file(Path(raw_path), f"DFG for task {task}")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = index_path.parent / path
+        path = _require_file(path, f"DFG for task {task}")
         result.append(f"--task-dfg={task}={path}")
     return result
 
@@ -505,10 +509,11 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
         sys.executable, str(required_adapters["extract"]),
         "--input", str(expanded_ir), "--output-dir", str(task_dir),
         "--index-output", str(task_index),
+        "--relative-index-paths",
     ]
     _run(extract_command, "extract-task-dfgs", output)
     index = _read_json_object(task_index, "task DFG index")
-    task_arguments = _task_dfg_arguments(index, selected_tasks)
+    task_arguments = _task_dfg_arguments(index, selected_tasks, task_index)
 
     _run(
         [sys.executable, str(required_adapters["features"]),
