@@ -14,7 +14,7 @@
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 // Stores the values that define a finite candidate space.
 struct ManifestHeader {
@@ -25,6 +25,7 @@ struct ManifestHeader {
   int64_t perCgraRows = 0;
   int64_t perCgraCols = 0;
   int64_t maxCgrasPerTask = 0;
+  int64_t maxCandidates = 0;
 };
 
 // Stores the record count that closes a manifest.
@@ -37,7 +38,8 @@ using CandidateConsumer =
 
 // For example, this candidate JSONL record:
 //
-//   {"record_type":"candidate","schema":"amoeba-analytical-task-candidates",
+//   {"record_type":"candidate",
+//    "schema":"amoeba-analytical-task-candidates",
 //    "candidate_id":"candidate-3","task_shapes":[{"task":"A",
 //    "trip_count":4,"shape":{"kind":"rect","rows":1,"cols":2,
 //    "cgra_count":2,"cgra_shape":"1x2","mapper_tile_rows":4,
@@ -60,7 +62,7 @@ bool readCandidateManifest(llvm::StringRef path,
                            CandidateConsumer consume, ManifestHeader &header,
                            ManifestFooter &footer, std::string &error);
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

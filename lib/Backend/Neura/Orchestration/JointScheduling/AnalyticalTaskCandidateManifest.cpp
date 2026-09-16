@@ -22,7 +22,7 @@ using namespace mlir;
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 static bool isSha256(StringRef value) {
   return value.size() == 64 && llvm::all_of(value, [](char character) {
@@ -107,6 +107,23 @@ static bool parseHeader(const llvm::json::Object &object,
     return false;
   }
 
+  const llvm::json::Object *budget = object.getObject("candidate_budget");
+  if (!budget) {
+    error = "candidate manifest is missing its enumeration budget";
+    return false;
+  }
+  auto budgetPolicy = requiredString(*budget, "policy", error);
+  auto maxCandidates = requiredInteger(*budget, "max_candidates", error);
+  std::optional<bool> complete = budget->getBoolean("complete");
+  if (!budgetPolicy || !maxCandidates || !complete)
+    return false;
+  if (*budgetPolicy != kSpatialCandidateBudgetPolicy || !*complete ||
+      *maxCandidates <= 0) {
+    error = "candidate budget must be positive, complete, and "
+            "fail-before-publish";
+    return false;
+  }
+
   auto gridRows = requiredInteger(*architecture, "grid_rows", error);
   auto gridCols = requiredInteger(*architecture, "grid_cols", error);
   auto perRows = requiredInteger(*architecture, "per_cgra_tile_rows", error);
@@ -120,7 +137,7 @@ static bool parseHeader(const llvm::json::Object &object,
   header = {function->str(), architectureSha->str(),
             *gridRows,       *gridCols,
             *perRows,        *perCols,
-            *maxCgras};
+            *maxCgras,       *maxCandidates};
   if (header.gridRows <= 0 || header.gridCols <= 0 || header.perCgraRows <= 0 ||
       header.perCgraCols <= 0 || header.maxCgrasPerTask <= 0) {
     error = "candidate manifest dimensions must be positive";
@@ -448,6 +465,10 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
                 "concurrently packable shape space";
         return false;
       }
+      if (count > static_cast<uint64_t>(header.maxCandidates)) {
+        error = "candidate manifest exceeds its recorded budget";
+        return false;
+      }
       footer = {count};
       sawFooter = true;
       continue;
@@ -462,7 +483,7 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
   return true;
 }
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

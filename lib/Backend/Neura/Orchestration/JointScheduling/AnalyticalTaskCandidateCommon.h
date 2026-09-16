@@ -27,7 +27,7 @@
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 inline constexpr llvm::StringLiteral kCandidateSchema =
     "amoeba-analytical-task-candidates";
@@ -63,7 +63,7 @@ bool writeAtomically(llvm::StringRef output,
                      llvm::function_ref<bool(llvm::raw_ostream &)> writeBody,
                      std::string &error);
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

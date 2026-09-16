@@ -25,7 +25,7 @@
 #include <string>
 
 using namespace mlir;
-using namespace mlir::amoeba::neura::analytical_dse;
+using namespace mlir::amoeba::neura::joint_scheduling;
 
 namespace {
 
@@ -227,7 +227,7 @@ struct ScoreAnalyticalTaskCandidatesPass
                 task->setAttr(
                     "cgra_shape",
                     builder.getStringAttr(choice.shape.toCgraShapeAttrValue()));
-                task->setAttr("amoeba.analytical_shape_orientation_fixed",
+                task->setAttr("amoeba.joint_shape_orientation_fixed",
                               builder.getUnitAttr());
                 task->setAttr("est_latency",
                               builder.getI64IntegerAttr(duration));
@@ -331,7 +331,7 @@ struct ScoreAnalyticalTaskCandidatesPass
       func.emitError() << error;
       return signalPassFailure();
     }
-    llvm::errs() << "[AnalyticalTaskDSE] scored all " << scoredCount
+    llvm::errs() << "[JointScheduling] scored all " << scoredCount
                  << " candidates with " << costs.cachedPredictions()
                  << " cached task-body/shape predictions\n";
   }

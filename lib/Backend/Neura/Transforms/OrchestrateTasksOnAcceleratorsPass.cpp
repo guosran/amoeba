@@ -57,13 +57,21 @@ struct OrchestrateTasksOnAcceleratorsPass
       *this, "orchestration-strategy",
       llvm::cl::desc("Task orchestration strategy: 'routing-critical-path' "
                      "(default) or 'analytical-based-task-orchestration' "
-                     "(requires a materialized analytical task candidate)."),
+                     "(requires a materialized joint-scheduling candidate)."),
       llvm::cl::init("routing-critical-path")};
 
   void runOnOperation() override {
-    SchedulingMode mode = (schedulingMode.getValue() == "spatial")
-                              ? SchedulingMode::Spatial
-                              : SchedulingMode::SpatialTemporal;
+    SchedulingMode mode;
+    if (schedulingMode.getValue() == "spatial") {
+      mode = SchedulingMode::Spatial;
+    } else if (schedulingMode.getValue() == "spatial-temporal") {
+      mode = SchedulingMode::SpatialTemporal;
+    } else {
+      getOperation()->emitError()
+          << "unknown task scheduling mode: " << schedulingMode.getValue();
+      signalPassFailure();
+      return;
+    }
     const neura::Architecture &architecture = neura::getArchitecture();
     std::unique_ptr<Orchestration> strategy = createOrchestrationStrategy(
         orchestrationStrategy.getValue(), architecture.getMultiCgraRows(),

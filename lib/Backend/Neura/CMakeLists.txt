@@ -26,7 +26,7 @@ add_mlir_library(MLIRAmoebaNeuraBackend
   MLIRAmoebaConversion
   MLIRAmoebaNeuraConversion
   MLIRAmoebaNeuraTransforms
-  MLIRAmoebaNeuraAnalyticalTaskDSE
+  MLIRAmoebaNeuraJointScheduling
   MLIRAmoebaNeuraOptimizations
   MLIRTaskflow
   MLIRNeura

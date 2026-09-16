@@ -65,7 +65,7 @@ def OrchestrateTasksOnAccelerators
       /*default=*/"\"routing-critical-path\"",
       "Task orchestration strategy: 'routing-critical-path' (default) or "
       "'analytical-based-task-orchestration' (requires a materialized "
-      "analytical task candidate).">];
+      "joint-scheduling candidate).">];
   let constructor =
       "::mlir::amoeba::neura::createOrchestrateTasksOnAcceleratorsPass()";
 }
@@ -150,15 +150,16 @@ def MaterializeAnalyticalTaskCandidate
 
 def ScoreAnalyticalTaskCandidates
     : Pass<"score-analytical-task-candidates", "ModuleOp"> {
-  let summary = "Score every candidate in a frozen analytical-task manifest";
+  let summary = "Score every candidate in a frozen spatial-binding manifest";
   let description = [{
     Validates and scores every candidate from a complete manifest using a
     provenance-bound external ML II/startup cost catalogue. Repeated queries
     share a stable task-body, architecture, and oriented-shape cache. Only
     after complete manifest traversal is a deterministic top-k shortlist
-    emitted. The current score is the maximum per-task compute duration;
-    communication and temporal scheduling remain outside this pass. A
-    symbol-dynamic trip count must be concretely bound before ranking.
+    emitted. The ranking score is the makespan produced by the production
+    fixed-orientation spatial-temporal scheduler using predicted task
+    durations. Communication remains outside this pass. A symbol-dynamic trip
+    count must be concretely bound before ranking.
   }];
   let options = [
     Option<"functionName", "function", "std::string", /*default=*/"\"\"",

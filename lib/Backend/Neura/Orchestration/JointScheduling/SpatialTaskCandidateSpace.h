@@ -24,7 +24,7 @@
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 inline constexpr llvm::StringLiteral kShapePolicy =
     "static-oriented-rectangles";
@@ -32,8 +32,9 @@ inline constexpr llvm::StringLiteral kSearchScope =
     "static-shape-concurrent-fit";
 inline constexpr llvm::StringLiteral kSpatialCapacityPolicy =
     "all-tasks-simultaneous-exact-pack";
-inline constexpr llvm::StringLiteral kShapePruningPolicy =
-    "none";
+inline constexpr llvm::StringLiteral kShapePruningPolicy = "none";
+inline constexpr llvm::StringLiteral kSpatialCandidateBudgetPolicy =
+    "fail-before-publish";
 
 // Stores one physical-CGRA rectangle and its corresponding mapper dimensions.
 struct RectShape {
@@ -96,7 +97,7 @@ bool visitConcurrentlyPackableShapeTuples(
     llvm::ArrayRef<llvm::SmallVector<RectShape>> shapesByTask,
     ConcurrentPackingCache &packing, ShapeIndexTupleConsumer consume);
 llvm::json::Object candidateJson(const Candidate &candidate);
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

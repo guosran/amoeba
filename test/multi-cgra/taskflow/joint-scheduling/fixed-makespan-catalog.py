@@ -22,7 +22,7 @@ def create(manifest_path, catalog_path):
     # by the pass.  The fixture copies it into catalogue provenance so the
     # scorer can reject a catalogue for another same-sized machine.
     architecture_sha = header["architecture"]["spec_sha256"]
-    # Task body hashes identify the current task IR after DSE-only attributes
+    # Task body hashes identify the current task IR after pipeline-only attributes
     # are removed.  Trip counts remain separate task metadata and are not folded
     # into this body identity.
     task_hashes = {
@@ -97,11 +97,24 @@ def verify(manifest_path, catalog_path, score_path):
     ]
 
 
+def uncensor(manifest_path, catalog_path):
+    """Create an invalid unsupported record that still leaks a prediction."""
+    create(manifest_path, catalog_path)
+    catalog = json.loads(catalog_path.read_text())
+    catalog["entries"][0]["support_status"] = "unsupported"
+    catalog_path.write_text(json.dumps(catalog, sort_keys=True) + "\n")
+
+
 if __name__ == "__main__":
     action, manifest, catalog, *remainder = sys.argv[1:]
     if action == "create" and not remainder:
         create(Path(manifest), Path(catalog))
+    elif action == "uncensor" and not remainder:
+        uncensor(Path(manifest), Path(catalog))
     elif action == "verify" and len(remainder) == 1:
         verify(Path(manifest), Path(catalog), Path(remainder[0]))
     else:
-        raise SystemExit("usage: fixed-makespan-catalog.py create|verify manifest catalog [scores]")
+        raise SystemExit(
+            "usage: fixed-makespan-catalog.py create|uncensor|verify "
+            "manifest catalog [scores]"
+        )

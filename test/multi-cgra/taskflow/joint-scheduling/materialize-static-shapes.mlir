@@ -43,7 +43,10 @@ module {
         will_writes(%a : memref<16xf32>)
         [original_read_memrefs(%a : memref<16xf32>),
          original_write_memrefs(%a : memref<16xf32>)]
-        {trip_count = 10 : i64}
+        {compiled_ii = 99 : i32, est_latency = 99 : i64,
+         profile_info = {duration = 99 : i32}, replicas = 2 : i32,
+         task_orchestration_info = {}, tiling = "stale",
+         trip_count = 10 : i64}
         : (memref<16xf32>, memref<16xf32>)
        -> (memref<16xf32>, memref<16xf32>) {
     ^bb0(%input: memref<16xf32>, %output: memref<16xf32>):
@@ -75,24 +78,30 @@ module {
 }
 
 // MATERIALIZED-LABEL: func.func @main
-// MATERIALIZED-SAME: analytical_task_candidate_id = "candidate-6"
+// MATERIALIZED-SAME: joint_scheduling_candidate_id = "candidate-6"
 // MATERIALIZED: taskflow.task @A
-// MATERIALIZED-SAME: amoeba.analytical_shape_orientation_fixed
+// MATERIALIZED-NOT: compiled_ii
+// MATERIALIZED-NOT: est_latency
+// MATERIALIZED-NOT: profile_info
+// MATERIALIZED-NOT: replicas
+// MATERIALIZED-NOT: task_orchestration_info
+// MATERIALIZED-NOT: tiling
+// MATERIALIZED-SAME: amoeba.joint_shape_orientation_fixed
 // MATERIALIZED-SAME: cgra_count = 2 : i32
 // MATERIALIZED-SAME: cgra_shape = "2x1"
 // MATERIALIZED: taskflow.task @B
-// MATERIALIZED-SAME: amoeba.analytical_shape_orientation_fixed
+// MATERIALIZED-SAME: amoeba.joint_shape_orientation_fixed
 // MATERIALIZED-SAME: cgra_count = 1 : i32
 // MATERIALIZED-SAME: cgra_shape = "1x1"
 // ORCHESTRATED-LABEL: func.func @main
-// ORCHESTRATED-SAME: analytical_task_candidate_id = "candidate-6"
+// ORCHESTRATED-SAME: joint_scheduling_candidate_id = "candidate-6"
 // ORCHESTRATED: taskflow.task @A
-// ORCHESTRATED-NOT: amoeba.analytical_shape_orientation_fixed
+// ORCHESTRATED-NOT: amoeba.joint_shape_orientation_fixed
 // ORCHESTRATED-SAME: cgra_positions = [{col = 0 : i32, context_id = 0 : i32, row = 0 : i32}, {col = 0 : i32, context_id = 0 : i32, row = 1 : i32}]
 // ORCHESTRATED: taskflow.task @B
-// ORCHESTRATED-NOT: amoeba.analytical_shape_orientation_fixed
+// ORCHESTRATED-NOT: amoeba.joint_shape_orientation_fixed
 // ORCHESTRATED-SAME: cgra_positions = [{col = 1 : i32, context_id = 0 : i32, row = 0 : i32}]
-// NO-REALLOCATE: resource-aware-task-optimization cannot run after an analytical task candidate has fixed resource shapes
+// NO-REALLOCATE: resource-aware-task-optimization cannot run after a joint-scheduling candidate has fixed resource shapes
 // INCOMPLETE: candidate manifest count does not match the complete concurrently packable shape space
-// UNBOUND: analytical-based task orchestration requires a non-empty analytical_task_candidate_id attribute
+// UNBOUND: joint resource binding requires a non-empty joint_scheduling_candidate_id attribute
 // NONRECT: invalid fixed cgra_shape: cgra_shape has invalid rectangle dimensions

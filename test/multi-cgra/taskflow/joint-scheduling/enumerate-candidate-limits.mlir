@@ -41,6 +41,7 @@ module {
 
 // LIMIT: complete concurrently packable shape space exceeds max-candidates=15
 // ONE-LABEL: {"architecture":{"grid_cols":4,"grid_rows":4,"per_cgra_tile_cols":4,"per_cgra_tile_rows":4,"spec_sha256":"1b96d6d3741805b057add7db66296c9c73cc45ea4ef0263e0eea5adb4f4360d6"}
+// ONE-SAME: "candidate_budget":{"complete":true,"max_candidates":1000000,"policy":"fail-before-publish"}
 // ONE-SAME: "max_cgras_per_task":1
 // ONE-SAME: "shape_pruning_policy":"none"
 // ONE: {"candidate_id":"candidate-0","record_type":"candidate","schema":"amoeba-analytical-task-candidates","task_shapes":[{"shape":{"cgra_count":1,"cgra_shape":"1x1","cols":1,"kind":"rect","mapper_tile_cols":4,"mapper_tile_rows":4,"rows":1},"task":"A","trip_count":10}]}

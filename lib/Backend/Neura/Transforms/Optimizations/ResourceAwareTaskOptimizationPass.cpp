@@ -13,9 +13,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Backend/Neura/NeuraBackendPasses.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowOps.h"
-#include "Backend/Neura/NeuraBackendPasses.h"
 
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/Mapping/mapping_util.h"
@@ -1676,7 +1676,7 @@ struct ResourceAwareTaskOptimizationPass
   //       to obtain accurate compiled_ii and steps from MapToAcceleratorPass.
   //   "analytical": uses only ResMII / RecMII analytical estimates without
   //       running the mapper.  Much faster but less accurate — useful for
-  //       rapid design-space exploration or when the mapper is unavailable.
+  //       rapid candidate evaluation or when the mapper is unavailable.
   Option<std::string> estimationMode{
       *this, "estimation-mode",
       llvm::cl::desc(
@@ -1702,16 +1702,17 @@ struct ResourceAwareTaskOptimizationPass
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
-    // A materialized analytical DSE candidate has already fixed each task's
+    // A materialized joint-scheduling candidate has already fixed each task's
     // resource count and oriented shape. Reallocating here would invalidate
     // the candidate selected by the scorer.
     bool has_fixed_shape = false;
     func.walk([&](TaskflowTaskOp task) {
-      has_fixed_shape |= task->hasAttr("amoeba.analytical_shape_orientation_fixed");
+      has_fixed_shape |= task->hasAttr("amoeba.joint_shape_orientation_fixed");
     });
     if (has_fixed_shape) {
-      func.emitError() << "resource-aware-task-optimization cannot run after "
-                          "an analytical task candidate has fixed resource shapes";
+      func.emitError()
+          << "resource-aware-task-optimization cannot run after "
+             "a joint-scheduling candidate has fixed resource shapes";
       return signalPassFailure();
     }
 

@@ -35,7 +35,7 @@ using namespace mlir::taskflow;
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 // Infers the execution count recorded in analytical candidate manifests from
 // constant Taskflow counter chains. Spatial and temporal candidate spaces use
@@ -167,7 +167,7 @@ static std::string sha256(StringRef bytes) {
 FailureOr<std::string> currentArchitectureSha256(std::string &error) {
   StringRef path = mlir::amoeba::getNeuraArchitectureSpecFile();
   if (path.empty()) {
-    error = "analytical task DSE requires --architecture-spec";
+    error = "joint scheduling requires --architecture-spec";
     return failure();
   }
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -209,7 +209,8 @@ static FailureOr<int64_t> resolveAnalyticalTripCount(TaskflowTaskOp task,
 // The enumerator writes this hash into each task record and attaches it to the
 // bound IR; materialization and the predictor use it to bind derived data to
 // the source task. A task-body edit changes the hash, so manifest validation
-// rejects old candidates and predictions. DSE outputs and measurements are
+// rejects old candidates and predictions. Joint-scheduling outputs and
+// measurements are
 // deliberately excluded so materializing or measuring a shape does not make
 // the same source computation look new.
 static std::string taskBodySha256(TaskflowTaskOp task) {
@@ -221,7 +222,7 @@ static std::string taskBodySha256(TaskflowTaskOp task) {
        {"trip_count", "cgra_count", "cgra_shape", "compiled_ii", "profile_info",
         "task_orchestration_info", "replicas", "tiling", "est_latency"})
     clone->removeAttr(attribute);
-  clone->removeAttr("amoeba.analytical_shape_orientation_fixed");
+  clone->removeAttr("amoeba.joint_shape_orientation_fixed");
   clone->removeAttr(kSourceTaskBodyShaAttr);
   std::string printed;
   llvm::raw_string_ostream stream(printed);
@@ -348,7 +349,7 @@ FailureOr<func::FuncOp> selectTaskFunction(ModuleOp module, StringRef requested,
   return taskFunctions.front();
 }
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

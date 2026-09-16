@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ML-score a frozen analytical spatial candidate space, then replay top-k.
+"""Rank a frozen spatial-binding candidate set, then replay the top entries.
 
 The predictor is loaded exclusively from Amoeba's pinned
 ``thirdparty/cgra-ii-predictor`` submodule. The input must already contain
@@ -84,16 +84,71 @@ def _run(command: Sequence[str], label: str, output: Path,
         )
 
 
-def _task_dfg_arguments(index: Mapping[str, object]) -> List[str]:
+def _task_dfg_arguments(index: Mapping[str, object],
+                        expected_tasks: Sequence[str]) -> List[str]:
     result: List[str] = []
-    if not index:
-        raise PipelineError("task DFG extraction produced an empty index")
-    for task, raw_path in sorted(index.items()):
+    if len(set(expected_tasks)) != len(expected_tasks):
+        raise PipelineError("selected function has duplicate task names")
+    for task in sorted(expected_tasks):
+        raw_path = index.get(task)
         if not isinstance(task, str) or not task or not isinstance(raw_path, str):
-            raise PipelineError("task DFG index must map task names to paths")
+            raise PipelineError(
+                f"DFG extraction did not produce selected task {task}"
+            )
         path = _require_file(Path(raw_path), f"DFG for task {task}")
         result.append(f"--task-dfg={task}={path}")
     return result
+
+
+def _candidate_task_names(path: Path) -> List[str]:
+    header, _ = _candidate_header_and_count(path)
+    raw_tasks = header.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise PipelineError("candidate manifest has no task metadata")
+    tasks = []
+    for record in raw_tasks:
+        if not isinstance(record, dict) or not isinstance(record.get("task"), str):
+            raise PipelineError("candidate manifest task metadata is invalid")
+        tasks.append(record["task"])
+    return tasks
+
+
+def _candidate_shapes(path: Path) -> Mapping[str, Sequence[Mapping[str, object]]]:
+    result = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict) or record.get("record_type") != "candidate":
+            continue
+        candidate_id = record.get("candidate_id")
+        task_shapes = record.get("task_shapes")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id in result
+            or not isinstance(task_shapes, list)
+            or not task_shapes
+        ):
+            raise PipelineError("candidate shape records are invalid")
+        shapes = []
+        for task_shape in task_shapes:
+            shape = task_shape.get("shape") if isinstance(task_shape, dict) else None
+            if (
+                not isinstance(shape, dict)
+                or isinstance(shape.get("cgra_count"), bool)
+                or not isinstance(shape.get("cgra_count"), int)
+                or shape["cgra_count"] <= 0
+            ):
+                raise PipelineError("candidate shape record is invalid")
+            shapes.append(shape)
+        result[candidate_id] = shapes
+    return result
+
+
+def _requests_pass(arguments: Sequence[str], pass_name: str) -> bool:
+    option = f"--{pass_name}"
+    return any(argument == option or argument.startswith(option + "=")
+               for argument in arguments)
 
 
 def _read_json_object(path: Path, label: str) -> Mapping[str, object]:
@@ -158,7 +213,7 @@ def _require_bound_trip_counts(path: Path) -> None:
             raise PipelineError("candidate manifest trip count is invalid")
     if unbound:
         raise PipelineError(
-            "program-level analytical ranking requires concrete trip counts; "
+            "program-level joint ranking requires concrete trip counts; "
             "symbol-dynamic tasks: " + ", ".join(unbound)
         )
 
@@ -293,8 +348,8 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
     bound_ir = output / "bound.mlir"
     task_dir = output / "task-dfgs"
     task_index = output / "task-dfgs.json"
-    analytical_input = output / "analytical-input.json"
-    analytical_timing = output / "analytical-timing.json"
+    predictor_input = output / "predictor-input.json"
+    analysis_timing = output / "analysis-timing.json"
     cost_catalog = output / "costs.json"
     inference_timing = output / "inference-timing.json"
     scores = output / "scores.jsonl"
@@ -317,29 +372,40 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
     )
     _require_bound_trip_counts(manifest)
 
+    selected_tasks = _candidate_task_names(manifest)
+    bound_text = bound_ir.read_text()
+    for task in selected_tasks:
+        occurrences = len(re.findall(
+            rf"\btaskflow\.task\s+@{re.escape(task)}\b", bound_text
+        ))
+        if occurrences != 1:
+            raise PipelineError(
+                f"selected task name {task} occurs {occurrences} times in the "
+                "module; function-scoped extraction requires globally unique "
+                "task names"
+            )
+
     extract_command = [
         sys.executable, str(required_adapters["extract"]),
         "--input", str(bound_ir), "--output-dir", str(task_dir),
         "--index-output", str(task_index),
     ]
-    if args.function:
-        extract_command.extend(("--function", args.function))
     _run(extract_command, "extract-task-dfgs", output)
     index = _read_json_object(task_index, "task DFG index")
-    task_arguments = _task_dfg_arguments(index)
+    task_arguments = _task_dfg_arguments(index, selected_tasks)
 
     _run(
         [sys.executable, str(required_adapters["features"]),
          "--manifest", str(manifest), *task_arguments,
          "--neura-opt", str(amoeba_opt), "--architecture", str(architecture),
-         "--output", str(analytical_input),
-         "--timing-output", str(analytical_timing)],
+         "--output", str(predictor_input),
+         "--timing-output", str(analysis_timing)],
         "analyze-task-shapes", output,
     )
     _run(
         [sys.executable, str(required_adapters["catalog"]),
          "--manifest", str(manifest),
-         "--analytical-input", str(analytical_input), *task_arguments,
+         "--analytical-input", str(predictor_input), *task_arguments,
          "--output", str(cost_catalog),
          "--timing-output", str(inference_timing),
          "--device", args.device],
@@ -360,6 +426,22 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
 
     downstream = list(args.downstream_args)
     shortlist = _read_shortlist(scores, manifest, cost_catalog, architecture)
+    shapes_by_candidate = _candidate_shapes(manifest)
+    mapper_requested = _requests_pass(downstream, "map-to-accelerator")
+    resource_binding_requested = _requests_pass(
+        downstream, "orchestrate-tasks-on-accelerators"
+    )
+    for item in shortlist:
+        candidate_id = str(item["candidate_id"])
+        shapes = shapes_by_candidate.get(candidate_id)
+        if shapes is None:
+            raise PipelineError("shortlisted candidate has no shape record")
+        if mapper_requested and any(shape["cgra_count"] != 1 for shape in shapes):
+            raise PipelineError(
+                "per-task full mapping for multi-CGRA shapes is not "
+                "implemented; refusing to run the module-level mapper with "
+                f"candidate {candidate_id}"
+            )
     shortlist_root = output / "shortlist"
     shortlist_root.mkdir()
     materialized = []
@@ -393,6 +475,16 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
         "input": str(input_path),
         "architecture": str(architecture),
         "predictor_submodule": str(PREDICTOR_ROOT),
+        "predictor_status": "pending_review",
+        "replay_contract": {
+            "full_mapper_status": (
+                "completed_single_cgra" if mapper_requested else "not_requested"
+            ),
+            "multi_cgra_full_mapping_supported": False,
+            "resource_binding_status": (
+                "completed" if resource_binding_requested else "not_requested"
+            ),
+        },
         "top_k_requested": args.top_k,
         "shortlist_materialization_invocations": len(materialized),
         "downstream_arguments": downstream,
@@ -400,8 +492,8 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
             "candidate_manifest": str(manifest),
             "bound_ir": str(bound_ir),
             "task_dfg_index": str(task_index),
-            "analytical_input": str(analytical_input),
-            "analytical_timing": str(analytical_timing),
+            "predictor_input": str(predictor_input),
+            "analysis_timing": str(analysis_timing),
             "cost_catalog": str(cost_catalog),
             "inference_timing": str(inference_timing),
             "scores": str(scores),
@@ -459,7 +551,7 @@ def main() -> int:
     try:
         report = run(parse_args())
     except (OSError, PipelineError, ValueError) as error:
-        print(f"analytical task DSE failed: {error}", file=sys.stderr)
+        print(f"joint scheduling failed: {error}", file=sys.stderr)
         return 1
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

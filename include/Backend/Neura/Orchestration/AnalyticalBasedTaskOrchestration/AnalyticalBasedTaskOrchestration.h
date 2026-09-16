@@ -1,4 +1,4 @@
-// Orchestration of a materialized analytical task candidate.
+// Orchestration of a materialized joint-scheduling candidate.
 
 #ifndef AMOEBA_ANALYTICAL_BASED_TASK_ORCHESTRATION_H
 #define AMOEBA_ANALYTICAL_BASED_TASK_ORCHESTRATION_H
@@ -19,7 +19,7 @@
 namespace mlir {
 namespace taskflow {
 
-// Orchestrates a materialized analytical task candidate.
+// Orchestrates a materialized joint-scheduling candidate.
 //
 // The current candidate space varies each task's fixed-orientation rectangular
 // region. The existing scheduler may execute the materialized candidate in

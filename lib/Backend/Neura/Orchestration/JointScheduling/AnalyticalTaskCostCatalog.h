@@ -1,6 +1,6 @@
 //===- AnalyticalTaskCostCatalog.h ---------------------------*- C++ -*-===//
 //
-// Declares the validated task-shape ML cost oracle used by analytical DSE.
+// Declares the validated task-shape ML cost oracle used by joint scheduling.
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,7 +20,7 @@
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 inline constexpr llvm::StringLiteral kCostSchema = "amoeba-task-shape-cost";
 inline constexpr llvm::StringLiteral kScoreSchema =
@@ -117,7 +117,7 @@ private:
 FailureOr<std::string> sha256File(llvm::StringRef path, std::string &error);
 bool samePath(llvm::StringRef lhs, llvm::StringRef rhs);
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

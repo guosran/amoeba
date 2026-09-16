@@ -21,7 +21,7 @@
 #include <string>
 
 using namespace mlir;
-using namespace mlir::amoeba::neura::analytical_dse;
+using namespace mlir::amoeba::neura::joint_scheduling;
 
 namespace {
 
@@ -212,6 +212,10 @@ struct EnumerateAnalyticalTaskCandidatesPass
               "exact-fit-required-coordinates-downstream-heuristic";
           fixedAxes["temporal_order"] = "downstream-heuristic";
           fixedAxes["communication"] = "not-scored";
+          llvm::json::Object budget;
+          budget["policy"] = kSpatialCandidateBudgetPolicy.str();
+          budget["max_candidates"] = maxCandidates.getValue();
+          budget["complete"] = true;
           llvm::json::Object header;
           header["record_type"] = "header";
           header["schema"] = kCandidateSchema.str();
@@ -222,6 +226,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
           header["function"] = function;
           header["architecture"] = std::move(architectureRecord);
           header["max_cgras_per_task"] = effectiveMaxCgrasPerTask;
+          header["candidate_budget"] = std::move(budget);
           header["tasks"] = std::move(tasks);
           header["cost_queries"] = std::move(costQueries);
           header["fixed_axes"] = std::move(fixedAxes);
@@ -229,7 +234,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
 
           // Emits every concurrently packable tuple in task-major shape order.
           // A tuple is emitted once even if it has multiple legal placements;
-          // placement itself is not a DSE axis yet.
+          // placement itself is not a candidate axis yet.
           uint64_t emitted = 0;
           bool emittedAll = visitConcurrentlyPackableShapeTuples(
               shapesByTask, packing,
@@ -275,7 +280,7 @@ struct EnumerateAnalyticalTaskCandidatesPass
     for (const TaskMetadata &task : *taskMetadata)
       task.op->setAttr(kSourceTaskBodyShaAttr,
                        StringAttr::get(func.getContext(), task.bodySha256));
-    llvm::errs() << "[AnalyticalTaskDSE] enumerated all " << candidateCount
+    llvm::errs() << "[JointScheduling] enumerated all " << candidateCount
                  << " concurrently packable shape candidates into "
                  << outputFile.getValue() << "\n";
   }

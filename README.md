@@ -6,9 +6,10 @@ transformations, and the integration layer used to connect Taskflow programs
 to architecture-specific backends.
 
 [Neura](https://github.com/coredac/neura) is currently the first supported
-backend and is consumed as a pinned Git submodule. Analytical task DSE also
-pins [cgra-ii-predictor](https://github.com/guosran/cgra-ii-predictor) as its
-external task-shape cost oracle. The project is structured so that additional
+backend and is consumed as a pinned Git submodule. The joint scheduling and
+resource-binding pipeline also pins
+[cgra-ii-predictor](https://github.com/guosran/cgra-ii-predictor) as its
+external task-shape cost predictor. The project is structured so that additional
 spatial dataflow backends can be integrated without moving
 architecture-specific concepts into the Taskflow core.
 
@@ -71,7 +72,7 @@ Amoeba requires:
   and
 - Git submodule support.
 
-Running the ML-ranked analytical task DSE driver additionally requires Python
+Running the ML-ranked joint scheduling driver additionally requires Python
 3 and PyTorch as declared by `thirdparty/cgra-ii-predictor/pyproject.toml`.
 
 This is the same LLVM revision used by the current
@@ -175,22 +176,22 @@ Neura-specific passes and options are registered by the Neura adapter. The
 architecture and latency options are exposed as `--neura-architecture-spec`
 and `--neura-latency-spec`.
 
-## Analytical task DSE
+## Joint scheduling and resource binding
 
-`tools/run-analytical-task-dse.py` connects Amoeba's candidate passes to the
-pinned II predictor. It freezes the complete concurrently packable static
-rectangle space in C++, extracts one pre-mapper Neura DFG per task, produces
-one provenance-bound cost per task and oriented mapper shape, scores every
-candidate, and invokes the forwarded real pipeline only for deterministic
-top-k entries.
+`tools/run-joint-scheduling.py` connects Amoeba's spatial-binding candidate
+passes to the pinned II predictor. It freezes the complete concurrently
+packable static rectangle set in C++, extracts one pre-mapper Neura DFG per
+task, produces one provenance-bound cost per task and oriented mapper shape,
+scores every candidate with the production scheduler, and invokes the
+forwarded real pipeline only for deterministic top-k entries.
 
 ```bash
-./tools/run-analytical-task-dse.py prepared-taskflow.mlir \
+./tools/run-joint-scheduling.py prepared-taskflow.mlir \
   --architecture test/archspec/architecture.yaml \
   --top-k 1 \
-  --output-dir /tmp/amoeba-analytical-dse \
+  --output-dir /tmp/amoeba-joint-scheduling \
   -- \
-  '--orchestrate-tasks-on-accelerators=orchestration-strategy=analytical-based-task-orchestration scheduling-mode=spatial'
+  '--orchestrate-tasks-on-accelerators=orchestration-strategy=analytical-based-task-orchestration scheduling-mode=spatial-temporal'
 ```
 
 The input must already contain Taskflow tasks with one pre-mapper Neura kernel
@@ -210,13 +211,13 @@ keeps every legal fixed-orientation rectangle in that range. Communication
 volume, fusion, fission, and tiling are not candidate axes in this spatial
 search.
 
-The DSE artifacts carry explicit SHA-256 provenance. `candidate_manifest_sha256`
+The pipeline artifacts carry explicit SHA-256 provenance. `candidate_manifest_sha256`
 is the hash of the exact candidate JSONL bytes, so a cost catalogue cannot be
 reused after candidate order or contents change. `architecture_sha256` is the
 hash of the exact architecture YAML bytes; grid dimensions alone do not
 identify routing, functional-unit, memory, or latency capabilities. Each
 `task_body_sha256` binds predictor costs to the current task IR after
-DSE-generated attributes are removed; the task's trip count is kept as a
+joint-scheduling attributes are removed; the task's trip count is kept as a
 separate metadata field because it changes duration rather than the task
 computation.
 `task_dfg_sha256` identifies the extracted DFG report used by the predictor.
@@ -226,6 +227,28 @@ the declarations but does not reopen those producer files. The score header
 repeats the candidate, architecture, and exact cost-catalogue hashes so the
 driver can verify the complete chain immediately before materializing a
 shortlist.
+
+This implementation intentionally covers only the status marked implemented
+or pending review in the joint-scheduling presentation: shared task metadata,
+static trip counts, complete fixed-orientation rectangular shape enumeration,
+fail-closed manifests, exact materialization, predictor integration, and
+scheduler-makespan ranking. General fusion/fission/tiling variant enumeration,
+communication binding, and transformed-graph temporal lowering remain planned;
+they are not represented as completed capabilities by this driver.
+
+The pinned predictor integration is explicitly **pending review**. Its current
+checkpoint contract does not implement the presentation's 156→64→32→1
+reference MLP or the complete set of 16 oriented rectangles on a 4×4 grid.
+The adapter rejects architectures and shapes outside its declared training
+contract; such rejections are censored records, never numeric costs. Do not
+treat the current FIR smoke test or `candidate-0` replay as 4×4 model
+validation.
+
+The current Neura mapper accepts one module-level array size rather than one
+size per Taskflow task. The driver therefore refuses to invoke it when a
+shortlisted candidate contains any multi-CGRA task; silently mapping such a
+candidate on the default array would not be a valid replay. The JSON report
+separately records predictor, resource-binding, and full-mapper status.
 
 ## Tests
 

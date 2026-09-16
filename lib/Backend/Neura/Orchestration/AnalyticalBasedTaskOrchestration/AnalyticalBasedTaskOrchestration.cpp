@@ -1,4 +1,4 @@
-// Orchestrates a materialized analytical task candidate.
+// Orchestrates a materialized joint-scheduling candidate.
 
 #include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
 
@@ -74,11 +74,10 @@ bool validateShapeString(StringRef shape_text, int cgra_count, int grid_rows,
 bool AnalyticalBasedTaskOrchestration::validateFixedShapeAttributes(
     func::FuncOp func) const {
   auto candidate_id =
-      func->getAttrOfType<StringAttr>("analytical_task_candidate_id");
+      func->getAttrOfType<StringAttr>("joint_scheduling_candidate_id");
   if (!candidate_id || candidate_id.getValue().empty()) {
-    func.emitError()
-        << "analytical-based task orchestration requires a non-empty "
-           "analytical_task_candidate_id attribute";
+    func.emitError() << "joint resource binding requires a non-empty "
+                        "joint_scheduling_candidate_id attribute";
     return false;
   }
 
@@ -88,9 +87,9 @@ bool AnalyticalBasedTaskOrchestration::validateFixedShapeAttributes(
       return;
     }
     if (!task->getAttrOfType<UnitAttr>(
-            "amoeba.analytical_shape_orientation_fixed")) {
-      task.emitError() << "analytical-based task orchestration requires "
-                          "amoeba.analytical_shape_orientation_fixed";
+            "amoeba.joint_shape_orientation_fixed")) {
+      task.emitError() << "joint resource binding requires "
+                          "amoeba.joint_shape_orientation_fixed";
       valid = false;
       return;
     }
@@ -98,7 +97,7 @@ bool AnalyticalBasedTaskOrchestration::validateFixedShapeAttributes(
     auto cgra_count = task->getAttrOfType<IntegerAttr>("cgra_count");
     if (!cgra_count || cgra_count.getInt() <= 0 ||
         cgra_count.getInt() > std::numeric_limits<int>::max()) {
-      task.emitError() << "analytical-based task orchestration requires a "
+      task.emitError() << "joint resource binding requires a "
                           "positive cgra_count";
       valid = false;
       return;
@@ -106,7 +105,7 @@ bool AnalyticalBasedTaskOrchestration::validateFixedShapeAttributes(
 
     auto cgra_shape = task->getAttrOfType<StringAttr>("cgra_shape");
     if (!cgra_shape || cgra_shape.getValue().empty()) {
-      task.emitError() << "analytical-based task orchestration requires a "
+      task.emitError() << "joint resource binding requires a "
                           "non-empty cgra_shape";
       valid = false;
       return;
@@ -173,6 +172,12 @@ AnalyticalBasedTaskOrchestration::computeRoutingCriticalPathPriority(
   for (TaskflowTaskOp consumer : tasks) {
     Operation *consumer_op = consumer.getOperation();
     auto add_producer_from_value = [&](Value value) {
+      DenseSet<Operation *> visited_channels;
+      while (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
+        if (!visited_channels.insert(channel.getOperation()).second)
+          return;
+        value = channel.getSource();
+      }
       if (auto producer = value.getDefiningOp<TaskflowTaskOp>()) {
         addDependencyEdge(successors, producer.getOperation(), consumer_op);
       }
@@ -208,8 +213,11 @@ bool AnalyticalBasedTaskOrchestration::runTaskOrchestration(func::FuncOp func) {
   if (!scheduler.schedule(func, priority)) {
     return false;
   }
+  func->setAttr("joint_scheduling_predicted_makespan",
+                IntegerAttr::get(IntegerType::get(func.getContext(), 64),
+                                 scheduler.getScheduleMakespan()));
   func.walk([](TaskflowTaskOp task) {
-    task->removeAttr("amoeba.analytical_shape_orientation_fixed");
+    task->removeAttr("amoeba.joint_shape_orientation_fixed");
   });
   return true;
 }

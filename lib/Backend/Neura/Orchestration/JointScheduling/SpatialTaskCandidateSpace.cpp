@@ -25,7 +25,7 @@ using namespace mlir::taskflow;
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 // Converts the physical CGRA rectangle into the string stored in the
 // Taskflow `cgra_shape` attribute, such as `1x2`.
@@ -38,7 +38,8 @@ std::string RectShape::toCgraShapeAttrValue() const {
 
 // Returns the occupied (column, row) offsets for one valid shape. This helper
 // deliberately belongs to the spatial candidate space: the shared scheduler
-// only needs to place already selected tasks and should not own DSE packing.
+// only needs to place already selected tasks and should not own candidate
+// packing.
 static std::optional<SmallVector<std::pair<int, int>>>
 getShapeCells(const CgraShape &shape, int gridRows, int gridCols) {
   if (shape.rows <= 0 || shape.cols <= 0 || shape.rows > gridRows ||
@@ -311,7 +312,7 @@ llvm::json::Object candidateJson(const Candidate &candidate) {
   return record;
 }
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir

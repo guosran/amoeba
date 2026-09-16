@@ -18,7 +18,7 @@
 #include <string>
 
 using namespace mlir;
-using namespace mlir::amoeba::neura::analytical_dse;
+using namespace mlir::amoeba::neura::joint_scheduling;
 
 namespace {
 
@@ -110,6 +110,13 @@ struct MaterializeAnalyticalTaskCandidatePass
     // heuristic mapper; this pass fabricates no placement or II.
     OpBuilder builder(func.getContext());
     for (auto [task, choice] : llvm::zip(*taskMetadata, selected->choices)) {
+      // These attributes are derived from a previous shape, placement, or
+      // profiling run. Keeping any of them would let a newly selected
+      // rectangle inherit facts for a different candidate.
+      for (StringRef attribute :
+           {"compiled_ii", "profile_info", "task_orchestration_info",
+            "replicas", "tiling", "est_latency"})
+        task.op->removeAttr(attribute);
       task.op->setAttr("cgra_count",
                        builder.getI32IntegerAttr(
                            static_cast<int32_t>(choice.shape.cgraCount())));
@@ -117,12 +124,12 @@ struct MaterializeAnalyticalTaskCandidatePass
                                          choice.shape.toCgraShapeAttrValue()));
       // The rectangle orientation is part of the selected candidate and must
       // remain unchanged during resource allocation.
-      task.op->setAttr("amoeba.analytical_shape_orientation_fixed",
+      task.op->setAttr("amoeba.joint_shape_orientation_fixed",
                        builder.getUnitAttr());
     }
-    func->setAttr("analytical_task_candidate_id",
+    func->setAttr("joint_scheduling_candidate_id",
                   builder.getStringAttr(selected->id));
-    func->setAttr("analytical_task_candidate_scope",
+    func->setAttr("joint_scheduling_candidate_scope",
                   builder.getStringAttr(kSearchScope));
   }
 };

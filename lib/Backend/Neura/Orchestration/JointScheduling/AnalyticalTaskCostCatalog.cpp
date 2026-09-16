@@ -20,7 +20,7 @@ using namespace mlir;
 namespace mlir {
 namespace amoeba {
 namespace neura {
-namespace analytical_dse {
+namespace joint_scheduling {
 
 // Checks the spelling of a provenance value.  This deliberately does not
 // establish what was hashed; the callers below compare each field with the
@@ -380,6 +380,11 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     } else if (*status != "unsupported") {
       error = "support_status must be supported or unsupported";
       return false;
+    } else if (entry->get("predicted_ii") || entry->get("startup_cycles") ||
+               entry->get("analytical_lower_bound")) {
+      error = "unsupported cost entries must be censored and contain no "
+              "numeric timing prediction";
+      return false;
     }
     CostQueryKey queryKey{task->str(), *mapperRows, *mapperCols};
     if (!catalog_.emplace(queryKey, cost).second) {
@@ -441,7 +446,7 @@ const TaskShapeCost *TaskShapeCostCache::get(const TaskShapeChoice &choice,
   return &inserted.first->second;
 }
 
-} // namespace analytical_dse
+} // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba
 } // namespace mlir
