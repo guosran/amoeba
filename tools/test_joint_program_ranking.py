@@ -48,6 +48,7 @@ class JointProgramRankingTest(unittest.TestCase):
                     "schema": GRAPH_SCHEMA,
                     "record_type": "variant",
                     "graph_variant_id": identifier,
+                    "graph_variant_sha256": sha256_file(ir),
                     "parent_graph_variant_id": None if index == 0 else identifiers[0],
                     "structural_sha256": f"{index + 1:064x}",
                     "result_ir": {
@@ -76,6 +77,9 @@ class JointProgramRankingTest(unittest.TestCase):
                     "artifact_dir": {
                         "path": "variants",
                         "path_base": "manifest_dir",
+                    },
+                    "preparation": {
+                        "contract": "amoeba-graph-variant-preparation-v1",
                     },
                 },
                 variant_records[0],

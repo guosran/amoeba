@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 
 GRAPH_SCHEMA = "amoeba-joint-task-graph-variants-v1"
+GRAPH_PREPARATION_CONTRACT = "amoeba-graph-variant-preparation-v1"
 CANDIDATE_SCHEMA = "amoeba-analytical-task-candidates"
 COST_SCHEMA = "amoeba-task-shape-cost"
 SCORE_SCHEMA = "amoeba-analytical-task-scores"
@@ -121,6 +122,9 @@ def load_graph_variants(path: Path) -> Tuple[Mapping[str, Any], List[GraphVarian
     artifact_root = _resolved_artifact(path, artifact_directory.get("path"))
     if not artifact_root.is_dir():
         raise RankingError("graph artifact directory does not exist")
+    preparation = _object(header.get("preparation"), "graph preparation")
+    if preparation.get("contract") != GRAPH_PREPARATION_CONTRACT:
+        raise RankingError("graph preparation contract is unsupported")
 
     source = _object(header.get("source"), "graph source")
     source_path = _resolved_artifact(path, source.get("path"))
@@ -165,6 +169,8 @@ def load_graph_variants(path: Path) -> Tuple[Mapping[str, Any], List[GraphVarian
                 "graph result IR escapes its artifact directory"
             ) from error
         ir_sha = _sha(result.get("sha256"), "graph result IR SHA-256")
+        if record.get("graph_variant_sha256") != ir_sha:
+            raise RankingError("graph variant SHA-256 fields disagree")
         if not ir_path.is_file() or sha256_file(ir_path) != ir_sha:
             raise RankingError(f"graph result IR mismatch for {identifier}")
         witness = _object(record.get("semantic_witness"), "semantic witness")
