@@ -140,6 +140,36 @@ def TaskflowChannelOp
   }];
 }
 
+// Joins independently written, statically disjoint regions of one memref.
+// This is a non-compute completion barrier, not a schedulable task.
+def TaskflowJoinOp
+    : TaskflowOpBase<"join", [Pure, SameOperandsAndResultType]> {
+  let summary = "Completion join for disjoint region write states";
+  let description = [{
+    Combines two or more task write states that all update statically disjoint
+    regions of the same base memref. The verifier binds every state to a
+    tiling-derived task, checks exact non-overlapping interval coverage on the
+    selected axis, and requires every tile to share the explicit base state.
+    Dependency walkers must recursively expand the tile states; this op is a
+    zero-compute completion barrier and must never be sent to a mapper.
+  }];
+
+  let arguments = (ins Variadic<AnyMemRef>:$tile_states,
+                       AnyMemRef:$base,
+                       I64Attr:$axis,
+                       DenseI64ArrayAttr:$region_lower,
+                       DenseI64ArrayAttr:$region_upper);
+  let results = (outs AnyMemRef:$joined);
+
+  let assemblyFormat = [{
+    `states` `(` $tile_states `)` `base` `(` $base `)`
+    `axis` `(` $axis `)` `region` `(` $region_lower `,` $region_upper `)`
+    attr-dict `:` type($joined)
+  }];
+
+  let hasVerifier = 1;
+}
+
 //----------------------------------------------------------------------
 // Intra-Task Operations.
 //----------------------------------------------------------------------

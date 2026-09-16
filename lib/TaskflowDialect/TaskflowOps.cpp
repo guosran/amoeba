@@ -1,12 +1,111 @@
 #include "TaskflowDialect/TaskflowOps.h"
 #include "TaskflowDialect/TaskflowDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
+#include "llvm/ADT/DenseSet.h"
+#include <algorithm>
 #include <cstddef>
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::taskflow;
+
+namespace {
+
+static std::optional<int64_t> constantIndex(Value value) {
+  if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+    return constant.value();
+  return std::nullopt;
+}
+
+static FailureOr<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
+stateRegion(Value state, Value expectedBase) {
+  if (auto join = state.getDefiningOp<TaskflowJoinOp>()) {
+    if (join.getBase() != expectedBase)
+      return failure();
+    return std::make_pair(SmallVector<int64_t>(join.getRegionLower()),
+                          SmallVector<int64_t>(join.getRegionUpper()));
+  }
+  auto task = state.getDefiningOp<TaskflowTaskOp>();
+  if (!task || !llvm::is_contained(task.getDoneWrites(), state) ||
+      task.getWillWrites().size() != 1 ||
+      task.getWillWrites().front() != expectedBase)
+    return failure();
+  SmallVector<int64_t> lower;
+  SmallVector<int64_t> upper;
+  SmallVector<TaskflowCounterOp> counters;
+  for (Operation &operation : task.getBody().front())
+    if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
+      counters.push_back(counter);
+  for (auto [index, counter] : llvm::enumerate(counters)) {
+    std::optional<int64_t> lb = constantIndex(counter.getLowerBound());
+    std::optional<int64_t> ub = constantIndex(counter.getUpperBound());
+    std::optional<int64_t> step = constantIndex(counter.getStep());
+    if (!lb || !ub || !step || *step != 1 || *ub <= *lb ||
+        (index == 0 && counter.getParentIndex()) ||
+        (index != 0 &&
+         counter.getParentIndex() != counters[index - 1].getCounterIndex()))
+      return failure();
+    lower.push_back(*lb);
+    upper.push_back(*ub);
+  }
+  if (lower.empty())
+    return failure();
+  return std::make_pair(std::move(lower), std::move(upper));
+}
+
+} // namespace
+
+LogicalResult TaskflowJoinOp::verify() {
+  if (getTileStates().size() < 2)
+    return emitOpError("requires at least two tile states");
+  auto type = dyn_cast<MemRefType>(getBase().getType());
+  if (!type || !type.hasStaticShape() || getJoined().getType() != type)
+    return emitOpError(
+        "requires one static memref type for base, states, and result");
+  int64_t axis = getAxis();
+  ArrayRef<int64_t> parentLower = getRegionLower();
+  ArrayRef<int64_t> parentUpper = getRegionUpper();
+  if (axis < 0 || axis >= type.getRank() ||
+      parentLower.size() != static_cast<size_t>(type.getRank()) ||
+      parentUpper.size() != static_cast<size_t>(type.getRank()))
+    return emitOpError("has invalid axis or parent region rank");
+  for (int64_t dim = 0; dim < type.getRank(); ++dim)
+    if (parentLower[dim] < 0 || parentUpper[dim] <= parentLower[dim] ||
+        parentUpper[dim] > type.getShape()[dim])
+      return emitOpError("parent region is outside the static memref shape");
+
+  SmallVector<std::pair<int64_t, int64_t>> intervals;
+  llvm::SmallDenseSet<Value, 8> uniqueStates;
+  for (Value state : getTileStates()) {
+    if (state.getType() != type || !uniqueStates.insert(state).second)
+      return emitOpError("requires distinct tile states of the base type");
+    auto region = stateRegion(state, getBase());
+    if (failed(region) || region->first.size() != parentLower.size() ||
+        region->second.size() != parentUpper.size())
+      return emitOpError("cannot prove a tile state's static region and base");
+    for (int64_t dim = 0; dim < type.getRank(); ++dim) {
+      if (dim == axis)
+        continue;
+      if (region->first[dim] != parentLower[dim] ||
+          region->second[dim] != parentUpper[dim])
+        return emitOpError("tile regions differ outside the selected axis");
+    }
+    intervals.push_back({region->first[axis], region->second[axis]});
+  }
+  llvm::sort(intervals);
+  int64_t cursor = parentLower[axis];
+  for (auto [lower, upper] : intervals) {
+    if (lower != cursor || upper <= lower)
+      return emitOpError("tile regions overlap or leave a gap");
+    cursor = upper;
+  }
+  if (cursor != parentUpper[axis])
+    return emitOpError("tile regions do not exactly cover the parent region");
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // TaskflowTaskOp
@@ -232,17 +331,15 @@ void TaskflowTaskOp::print(OpAsmPrinter &printer) {
 
   // Prints function type.
   printer << " : (";
-  llvm::interleaveComma(
-      llvm::concat<const Type>(getWillReads().getTypes(),
-                               getWillWrites().getTypes(),
-                               getValueInputs().getTypes()),
-      printer);
+  llvm::interleaveComma(llvm::concat<const Type>(getWillReads().getTypes(),
+                                                 getWillWrites().getTypes(),
+                                                 getValueInputs().getTypes()),
+                        printer);
   printer << ") -> (";
-  llvm::interleaveComma(
-      llvm::concat<const Type>(getDoneReads().getTypes(),
-                               getDoneWrites().getTypes(),
-                               getValueOutputs().getTypes()),
-      printer);
+  llvm::interleaveComma(llvm::concat<const Type>(getDoneReads().getTypes(),
+                                                 getDoneWrites().getTypes(),
+                                                 getValueOutputs().getTypes()),
+                        printer);
   printer << ")";
 
   // Prints region.

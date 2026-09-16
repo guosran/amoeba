@@ -224,6 +224,15 @@ static std::string taskBodySha256(TaskflowTaskOp task) {
     clone->removeAttr(attribute);
   clone->removeAttr("amoeba.joint_shape_orientation_fixed");
   clone->removeAttr(kSourceTaskBodyShaAttr);
+  SmallVector<StringRef> rewriteLineage;
+  for (NamedAttribute attribute : clone->getAttrs()) {
+    StringRef name = attribute.getName().strref();
+    if (name.starts_with("amoeba.fission.") ||
+        name.starts_with("amoeba.tiling."))
+      rewriteLineage.push_back(name);
+  }
+  for (StringRef name : rewriteLineage)
+    clone->removeAttr(name);
   std::string printed;
   llvm::raw_string_ostream stream(printed);
   OpPrintingFlags flags;

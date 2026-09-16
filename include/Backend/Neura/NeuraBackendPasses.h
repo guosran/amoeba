@@ -29,7 +29,10 @@ std::unique_ptr<Pass> createEnumerateAnalyticalTaskCandidatesPass();
 std::unique_ptr<Pass> createScoreAnalyticalTaskCandidatesPass();
 std::unique_ptr<Pass> createMaterializeAnalyticalTaskCandidatePass();
 std::unique_ptr<Pass> createMapJointSchedulingTasksPass();
+std::unique_ptr<Pass> createExtractJointTaskGraphFactsPass();
 std::unique_ptr<Pass> createFuseTaskPass();
+std::unique_ptr<Pass> createFissionTaskPass();
+std::unique_ptr<Pass> createTileTaskPass();
 std::unique_ptr<Pass> createResourceAwareTaskOptimizationPass();
 
 #define GEN_PASS_REGISTRATION

@@ -60,17 +60,28 @@ RoutingCriticalPathOrchestration::computeRoutingCriticalPathPriority(
 
   for (TaskflowTaskOp consumer : tasks) {
     Operation *consumer_op = consumer.getOperation();
-    auto addProducerFromValue = [&](Value value) {
-      if (auto producer = value.getDefiningOp<TaskflowTaskOp>()) {
-        addDependencyEdge(successors, producer.getOperation(), consumer_op);
+    DenseSet<Value> visited;
+    auto addProducerFromValue = [&](auto &&self, Value value) -> void {
+      if (!visited.insert(value).second)
+        return;
+      if (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
+        self(self, channel.getSource());
+        return;
       }
+      if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
+        for (Value state : join.getTileStates())
+          self(self, state);
+        return;
+      }
+      if (auto producer = value.getDefiningOp<TaskflowTaskOp>())
+        addDependencyEdge(successors, producer.getOperation(), consumer_op);
     };
 
     for (Value value_input : consumer.getValueInputs()) {
-      addProducerFromValue(value_input);
+      addProducerFromValue(addProducerFromValue, value_input);
     }
     for (Value operand : consumer->getOperands()) {
-      addProducerFromValue(operand);
+      addProducerFromValue(addProducerFromValue, operand);
     }
   }
 

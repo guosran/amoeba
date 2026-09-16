@@ -324,17 +324,24 @@ private:
   }
 
   void addProducerDependency(Value operand, TaskNode *consumer) {
-    llvm::DenseSet<Operation *> visitedChannels;
-    while (auto channel = operand.getDefiningOp<TaskflowChannelOp>()) {
-      if (!visitedChannels.insert(channel.getOperation()).second)
+    llvm::DenseSet<Value> visited;
+    auto visit = [&](auto &&self, Value value) -> void {
+      if (!visited.insert(value).second)
         return;
-      operand = channel.getSource();
-    }
-    if (auto producer_op = operand.getDefiningOp<TaskflowTaskOp>()) {
-      if (auto *producer = op_to_node[producer_op]) {
-        addDependencyEdge(producer, consumer);
+      if (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
+        self(self, channel.getSource());
+        return;
       }
-    }
+      if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
+        for (Value state : join.getTileStates())
+          self(self, state);
+        return;
+      }
+      if (auto producerOp = value.getDefiningOp<TaskflowTaskOp>())
+        if (auto *producer = op_to_node[producerOp])
+          addDependencyEdge(producer, consumer);
+    };
+    visit(visit, operand);
   }
 
   void addDependencyEdge(TaskNode *producer, TaskNode *consumer) {

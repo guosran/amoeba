@@ -6,14 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "TaskflowDialect/TaskflowDialect.h"
-#include "TaskflowDialect/TaskflowOps.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Conversion/NeuraConversionPasses.h"
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraPasses.h"
+#include "TaskflowDialect/TaskflowDialect.h"
+#include "TaskflowDialect/TaskflowOps.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/Passes.h"
@@ -58,6 +58,25 @@ static Value resolveThrough(Value v, TaskflowTaskOp task) {
     if (v == task.getDoneWrites()[i])
       return task.getWillWrites()[i];
   return v;
+}
+
+static Value peelChannels(Value value) {
+  while (auto channel = value.getDefiningOp<TaskflowChannelOp>())
+    value = channel.getSource();
+  return value;
+}
+
+static bool
+collectExclusiveChannelPath(Value producerResult, Value consumerInput,
+                            SmallVectorImpl<TaskflowChannelOp> &channels) {
+  Value current = consumerInput;
+  while (auto channel = current.getDefiningOp<TaskflowChannelOp>()) {
+    if (!current.hasOneUse())
+      return false;
+    channels.push_back(channel);
+    current = channel.getSource();
+  }
+  return current == producerResult && producerResult.hasOneUse();
 }
 
 // Collects unique values from two ranges into a deduped vector with index map.
@@ -168,7 +187,32 @@ static bool scfForBoundsMatch(scf::ForOp a, scf::ForOp b) {
 // Returns true if task1 dominates task2 in the same block.
 static bool canFuseTasks(TaskflowTaskOp t1, TaskflowTaskOp t2) {
   return t1 && t2 && t1 != t2 && t1->getBlock() == t2->getBlock() &&
-         t1->isBeforeInBlock(t2);
+         !t1->hasAttr("amoeba.control_predecessors") &&
+         !t2->hasAttr("amoeba.control_predecessors") && t1->isBeforeInBlock(t2);
+}
+
+// Selected fusion is materialized at the second task. Crossing independent
+// Taskflow tasks is safe because their effects are represented by SSA state;
+// crossing any other operation, or a task that consumes a first-task result,
+// would change ordering or violate dominance and is rejected.
+static bool canMoveFirstToSecond(TaskflowTaskOp first, TaskflowTaskOp second) {
+  if (!canFuseTasks(first, second))
+    return false;
+  llvm::SmallPtrSet<Operation *, 8> intervening;
+  for (Operation *operation = first->getNextNode();
+       operation && operation != second.getOperation();
+       operation = operation->getNextNode()) {
+    if (isa<TaskflowChannelOp>(operation))
+      continue;
+    if (!isa<TaskflowTaskOp>(operation))
+      return false;
+    intervening.insert(operation);
+  }
+  for (Value result : first->getResults())
+    for (OpOperand &use : result.getUses())
+      if (intervening.contains(use.getOwner()))
+        return false;
+  return true;
 }
 
 // Returns true if any write output of the producer feeds the consumer.
@@ -244,7 +288,7 @@ static bool hasInterveningUses(TaskflowTaskOp producer,
     }
     if (&op == consumer.getOperation())
       break;
-    if (in_range)
+    if (in_range && !isa<TaskflowChannelOp>(&op))
       for (Value v : op.getOperands())
         if (results.count(v))
           return true;
@@ -311,7 +355,8 @@ static bool haveMatchingLoopStructure(TaskflowTaskOp t1, TaskflowTaskOp t2) {
 // for the intermediate memref.
 static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
                                                 TaskflowTaskOp consumer,
-                                                Value intermediate_memref,
+                                                Value producer_intermediate,
+                                                Value consumer_intermediate,
                                                 OpBuilder &builder) {
   Location loc = consumer.getLoc();
   auto prod_read = producer.getWillReads();
@@ -327,12 +372,12 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
   for (Value v : prod_read)
     fused_read.push_back(v);
   for (Value v : cons_read)
-    if (v != intermediate_memref)
+    if (v != consumer_intermediate)
       fused_read.push_back(resolveThrough(v, producer));
   for (Value v : prod_write)
     fused_write.push_back(v);
   for (Value v : cons_write)
-    if (v != intermediate_memref)
+    if (v != consumer_intermediate)
       fused_write.push_back(resolveThrough(v, producer));
   for (Value v : prod_val)
     fused_val.push_back(v);
@@ -345,8 +390,7 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
     read_out_types.push_back(v.getType());
 
   // Write/value output types come from the consumer only.
-  SmallVector<Type> write_out_types(
-      consumer.getDoneWrites().getTypes());
+  SmallVector<Type> write_out_types(consumer.getDoneWrites().getTypes());
   SmallVector<Type> val_out_types(consumer.getValueOutputs().getTypes());
 
   SmallVector<Value> orig_reads, orig_writes;
@@ -394,7 +438,7 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
   // write memref block arg.
   BlockArgument prod_intermediate_arg = nullptr;
   for (unsigned i = 0; i < producer.getDoneWrites().size(); ++i)
-    if (producer.getDoneWrites()[i] == intermediate_memref)
+    if (producer.getDoneWrites()[i] == producer_intermediate)
       prod_intermediate_arg = prod_body.getArgument(prod_read.size() + i);
 
   OpBuilder::InsertionGuard guard(builder);
@@ -404,7 +448,7 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
   Block &cons_body = consumer.getBody().front();
   unsigned cons_read_fused = prod_read.size();
   for (unsigned i = 0; i < cons_read.size(); ++i) {
-    if (cons_read[i] == intermediate_memref) {
+    if (cons_read[i] == consumer_intermediate) {
       if (prod_intermediate_arg)
         mapping.map(cons_body.getArgument(i),
                     mapping.lookupOrDefault(prod_intermediate_arg));
@@ -415,7 +459,7 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
   }
   unsigned cons_write_fused = fused_read_n + prod_write.size();
   for (unsigned i = 0; i < cons_write.size(); ++i) {
-    if (cons_write[i] == intermediate_memref) {
+    if (cons_write[i] == consumer_intermediate) {
       if (prod_intermediate_arg)
         mapping.map(cons_body.getArgument(cons_read.size() + i),
                     mapping.lookupOrDefault(prod_intermediate_arg));
@@ -465,7 +509,7 @@ static TaskflowTaskOp fuseProducerConsumerTasks(TaskflowTaskOp producer,
   // Identifies the consumer's intermediate read block arg for load skipping.
   BlockArgument cons_intermediate_arg = nullptr;
   for (unsigned i = 0; i < cons_read.size(); ++i)
-    if (cons_read[i] == intermediate_memref)
+    if (cons_read[i] == consumer_intermediate)
       cons_intermediate_arg = cons_body.getArgument(i);
 
   {
@@ -1047,7 +1091,8 @@ static ModuleOp createFusedTestModule(TaskflowTaskOp task1,
   // Fuses the cloned tasks.
   TaskflowTaskOp fused;
   if (is_producer_consumer) {
-    fused = fuseProducerConsumerTasks(ct1, ct2, cloned_intermediate, builder);
+    fused = fuseProducerConsumerTasks(ct1, ct2, cloned_intermediate,
+                                      cloned_intermediate, builder);
   } else {
     fused = fuseSiblingTasks(ct1, ct2, builder);
   }
@@ -1142,6 +1187,167 @@ static bool isFusionProfitable(TaskflowTaskOp task1, TaskflowTaskOp task2,
   return profitable;
 }
 
+static void replaceProducerConsumerResults(TaskflowTaskOp producer,
+                                           TaskflowTaskOp consumer,
+                                           Value consumerIntermediate,
+                                           TaskflowTaskOp fused) {
+  for (unsigned i = 0; i < producer.getDoneReads().size(); ++i) {
+    Value original = producer.getWillReads()[i];
+    for (unsigned j = 0; j < fused.getWillReads().size(); ++j)
+      if (fused.getWillReads()[j] == original) {
+        producer.getDoneReads()[i].replaceAllUsesWith(fused.getDoneReads()[j]);
+        break;
+      }
+  }
+  for (unsigned i = 0; i < consumer.getDoneReads().size(); ++i) {
+    Value original = consumer.getWillReads()[i];
+    if (original == consumerIntermediate)
+      continue;
+    Value resolved = resolveThrough(original, producer);
+    for (unsigned j = 0; j < fused.getWillReads().size(); ++j)
+      if (fused.getWillReads()[j] == resolved) {
+        consumer.getDoneReads()[i].replaceAllUsesWith(fused.getDoneReads()[j]);
+        break;
+      }
+  }
+  for (auto [oldResult, newResult] :
+       llvm::zip(consumer.getDoneWrites(), fused.getDoneWrites()))
+    oldResult.replaceAllUsesWith(newResult);
+  for (auto [oldResult, newResult] :
+       llvm::zip(consumer.getValueOutputs(), fused.getValueOutputs()))
+    oldResult.replaceAllUsesWith(newResult);
+}
+
+static void replaceSiblingResults(TaskflowTaskOp first, TaskflowTaskOp second,
+                                  TaskflowTaskOp fused) {
+  for (TaskflowTaskOp task : {first, second}) {
+    for (unsigned i = 0; i < task.getDoneReads().size(); ++i) {
+      Value original = task.getWillReads()[i];
+      if (task == second)
+        original = resolveThrough(original, first);
+      for (unsigned j = 0; j < fused.getWillReads().size(); ++j)
+        if (fused.getWillReads()[j] == original) {
+          task.getDoneReads()[i].replaceAllUsesWith(fused.getDoneReads()[j]);
+          break;
+        }
+    }
+  }
+  unsigned firstWrites = first.getDoneWrites().size();
+  unsigned firstValues = first.getValueOutputs().size();
+  for (unsigned i = 0; i < firstWrites; ++i)
+    first.getDoneWrites()[i].replaceAllUsesWith(fused.getDoneWrites()[i]);
+  for (unsigned i = 0; i < firstValues; ++i)
+    first.getValueOutputs()[i].replaceAllUsesWith(fused.getValueOutputs()[i]);
+  for (unsigned i = 0; i < second.getDoneWrites().size(); ++i)
+    second.getDoneWrites()[i].replaceAllUsesWith(
+        fused.getDoneWrites()[firstWrites + i]);
+  for (unsigned i = 0; i < second.getValueOutputs().size(); ++i)
+    second.getValueOutputs()[i].replaceAllUsesWith(
+        fused.getValueOutputs()[firstValues + i]);
+}
+
+static LogicalResult fuseSelectedPair(func::FuncOp function,
+                                      StringRef firstName, StringRef secondName,
+                                      StringRef kind) {
+  SmallVector<TaskflowTaskOp> firstMatches;
+  SmallVector<TaskflowTaskOp> secondMatches;
+  function.walk([&](TaskflowTaskOp task) {
+    if (task.getTaskName() == firstName)
+      firstMatches.push_back(task);
+    if (task.getTaskName() == secondName)
+      secondMatches.push_back(task);
+  });
+  if (firstMatches.size() != 1 || secondMatches.size() != 1) {
+    function.emitError() << "selected fusion names must each identify one task";
+    return failure();
+  }
+  TaskflowTaskOp first = firstMatches.front();
+  TaskflowTaskOp second = secondMatches.front();
+  if (!canMoveFirstToSecond(first, second) ||
+      !haveMatchingLoopStructure(first, second)) {
+    function.emitError()
+        << "selected fusion cannot safely move the first task to the second "
+           "task's position or has mismatched loop domains";
+    return failure();
+  }
+  std::string fusedName =
+      (Twine(firstName) + ".fuse." + Twine(secondName)).str();
+  bool nameCollision = false;
+  function.walk([&](TaskflowTaskOp task) {
+    if (task != first && task != second && task.getTaskName() == fusedName)
+      nameCollision = true;
+  });
+  if (nameCollision) {
+    function.emitError() << "selected fusion-derived task name already exists";
+    return failure();
+  }
+
+  PatternRewriter rewriter(function.getContext());
+  rewriter.setInsertionPoint(second);
+  if (kind == "producer-consumer") {
+    struct Intermediate {
+      Value producerResult;
+      Value consumerInput;
+      SmallVector<TaskflowChannelOp> channels;
+    };
+    SmallVector<Intermediate> intermediates;
+    for (Value input : second.getWillReads()) {
+      Value source = peelChannels(input);
+      if (!llvm::is_contained(first.getDoneWrites(), source))
+        continue;
+      Intermediate intermediate{source, input, {}};
+      if (collectExclusiveChannelPath(source, input, intermediate.channels))
+        intermediates.push_back(std::move(intermediate));
+    }
+    if (intermediates.size() != 1 || hasInterveningUses(first, second)) {
+      function.emitError() << "selected producer-consumer fusion requires one "
+                              "direct single-use RAW edge";
+      return failure();
+    }
+    Intermediate &intermediate = intermediates.front();
+    for (Value result : first.getDoneWrites()) {
+      if (result != intermediate.producerResult && !result.use_empty()) {
+        function.emitError()
+            << "selected producer has another live write result";
+        return failure();
+      }
+    }
+    for (Value result : first.getValueOutputs()) {
+      if (!result.use_empty()) {
+        function.emitError()
+            << "selected producer has another live value result";
+        return failure();
+      }
+    }
+    TaskflowTaskOp fused =
+        fuseProducerConsumerTasks(first, second, intermediate.producerResult,
+                                  intermediate.consumerInput, rewriter);
+    fused->setAttr("task_name", rewriter.getStringAttr(fusedName));
+    replaceProducerConsumerResults(first, second, intermediate.consumerInput,
+                                   fused);
+    rewriter.eraseOp(second);
+    for (TaskflowChannelOp channel : intermediate.channels)
+      rewriter.eraseOp(channel);
+    rewriter.eraseOp(first);
+    return success();
+  }
+  if (kind == "sibling") {
+    if (!areSiblingTasks(first, second)) {
+      function.emitError() << "selected sibling fusion requires shared input "
+                              "and no inter-task dependence";
+      return failure();
+    }
+    TaskflowTaskOp fused = fuseSiblingTasks(first, second, rewriter);
+    fused->setAttr("task_name", rewriter.getStringAttr(fusedName));
+    replaceSiblingResults(first, second, fused);
+    rewriter.eraseOp(first);
+    rewriter.eraseOp(second);
+    return success();
+  }
+  function.emitError() << "fusion-kind must be producer-consumer or sibling";
+  return failure();
+}
+
 //===----------------------------------------------------------------------===//
 // Rewrite patterns
 //===----------------------------------------------------------------------===//
@@ -1179,41 +1385,10 @@ struct ProducerConsumerTaskFusion : public OpRewritePattern<TaskflowTaskOp> {
         !tryFindProducer(consumer.getWillWrites()))
       return failure();
 
-    auto fused =
-        fuseProducerConsumerTasks(producer, consumer, intermediate, rewriter);
+    auto fused = fuseProducerConsumerTasks(producer, consumer, intermediate,
+                                           intermediate, rewriter);
 
-    // Replaces producer's done_reads results.
-    for (unsigned i = 0; i < producer.getDoneReads().size(); ++i) {
-      Value orig_read = producer.getWillReads()[i];
-      for (unsigned j = 0; j < fused.getWillReads().size(); ++j) {
-        if (fused.getWillReads()[j] == orig_read) {
-          producer.getDoneReads()[i].replaceAllUsesWith(
-              fused.getDoneReads()[j]);
-          break;
-        }
-      }
-    }
-    // Replaces consumer's done_reads results.
-    for (unsigned i = 0; i < consumer.getDoneReads().size(); ++i) {
-      Value orig_read = consumer.getWillReads()[i];
-      if (orig_read == intermediate)
-        continue;
-      Value resolved = resolveThrough(orig_read, producer);
-      for (unsigned j = 0; j < fused.getWillReads().size(); ++j) {
-        if (fused.getWillReads()[j] == resolved) {
-          consumer.getDoneReads()[i].replaceAllUsesWith(
-              fused.getDoneReads()[j]);
-          break;
-        }
-      }
-    }
-    // Replaces consumer's write and value outputs.
-    for (auto [o, n] : llvm::zip(consumer.getDoneWrites(),
-                                 fused.getDoneWrites()))
-      o.replaceAllUsesWith(n);
-    for (auto [o, n] :
-         llvm::zip(consumer.getValueOutputs(), fused.getValueOutputs()))
-      o.replaceAllUsesWith(n);
+    replaceProducerConsumerResults(producer, consumer, intermediate, fused);
     rewriter.eraseOp(consumer);
     rewriter.eraseOp(producer);
     return success();
@@ -1243,43 +1418,7 @@ struct SiblingTaskFusion : public OpRewritePattern<TaskflowTaskOp> {
 
     auto fused = fuseSiblingTasks(t1, t2, rewriter);
 
-    // Replaces done_reads for both tasks.
-    for (unsigned i = 0; i < t1.getDoneReads().size(); ++i) {
-      Value orig_read = t1.getWillReads()[i];
-      for (unsigned j = 0; j < fused.getWillReads().size(); ++j) {
-        if (fused.getWillReads()[j] == orig_read) {
-          t1.getDoneReads()[i].replaceAllUsesWith(
-              fused.getDoneReads()[j]);
-          break;
-        }
-      }
-    }
-    for (unsigned i = 0; i < t2.getDoneReads().size(); ++i) {
-      Value orig_read = t2.getWillReads()[i];
-      Value resolved = resolveThrough(orig_read, t1);
-      for (unsigned j = 0; j < fused.getWillReads().size(); ++j) {
-        if (fused.getWillReads()[j] == resolved) {
-          t2.getDoneReads()[i].replaceAllUsesWith(
-              fused.getDoneReads()[j]);
-          break;
-        }
-      }
-    }
-
-    // Replaces done_writes and value_outputs.
-    unsigned t1_wo = t1.getDoneWrites().size();
-    unsigned t1_vo = t1.getValueOutputs().size();
-    for (unsigned i = 0; i < t1_wo; ++i)
-      t1.getDoneWrites()[i].replaceAllUsesWith(
-          fused.getDoneWrites()[i]);
-    for (unsigned i = 0; i < t1_vo; ++i)
-      t1.getValueOutputs()[i].replaceAllUsesWith(fused.getValueOutputs()[i]);
-    for (unsigned i = 0; i < t2.getDoneWrites().size(); ++i)
-      t2.getDoneWrites()[i].replaceAllUsesWith(
-          fused.getDoneWrites()[t1_wo + i]);
-    for (unsigned i = 0; i < t2.getValueOutputs().size(); ++i)
-      t2.getValueOutputs()[i].replaceAllUsesWith(
-          fused.getValueOutputs()[t1_vo + i]);
+    replaceSiblingResults(t1, t2, fused);
     rewriter.eraseOp(t1);
     rewriter.eraseOp(t2);
     return success();
@@ -1296,10 +1435,23 @@ struct FuseTaskPass
     : public PassWrapper<FuseTaskPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseTaskPass)
 
+  FuseTaskPass() = default;
+  FuseTaskPass(const FuseTaskPass &other) : PassWrapper(other) {}
+
   StringRef getArgument() const override { return "fuse-task"; }
   StringRef getDescription() const override {
-    return "Fuses taskflow.task ops via counter chain and hyperblock merging.";
+    return "Fuse a selected legal task pair or run the legacy greedy policy.";
   }
+
+  Option<std::string> firstTaskName{
+      *this, "first-task", llvm::cl::desc("First selected Taskflow task"),
+      llvm::cl::init("")};
+  Option<std::string> secondTaskName{
+      *this, "second-task", llvm::cl::desc("Second selected Taskflow task"),
+      llvm::cl::init("")};
+  Option<std::string> fusionKind{*this, "fusion-kind",
+                                 llvm::cl::desc("producer-consumer or sibling"),
+                                 llvm::cl::init("")};
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
@@ -1310,6 +1462,19 @@ struct FuseTaskPass
   }
 
   void runOnOperation() override {
+    if (!firstTaskName.empty() || !secondTaskName.empty() ||
+        !fusionKind.empty()) {
+      if (firstTaskName.empty() || secondTaskName.empty() ||
+          fusionKind.empty() || firstTaskName == secondTaskName) {
+        getOperation().emitError("selected fusion requires distinct first-task "
+                                 "and second-task plus fusion-kind");
+        return signalPassFailure();
+      }
+      if (failed(fuseSelectedPair(getOperation(), firstTaskName, secondTaskName,
+                                  fusionKind)))
+        signalPassFailure();
+      return;
+    }
     RewritePatternSet patterns(&getContext());
     patterns.add<ProducerConsumerTaskFusion>(&getContext(), /*benefit=*/10);
     patterns.add<SiblingTaskFusion>(&getContext(), /*benefit=*/5);

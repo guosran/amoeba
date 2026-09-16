@@ -238,6 +238,43 @@ def FuseTask : Pass<"fuse-task", "func::FuncOp"> {
                            "mlir::taskflow::TaskflowDialect"];
 }
 
+def ExtractJointTaskGraphFacts
+    : Pass<"extract-joint-task-graph-facts", "ModuleOp"> {
+  let summary = "Extract Taskflow graph facts and legal rewrite actions";
+  let description = [{
+    Writes deterministic task facts, dependencies, shape needs, a canonical
+    structural key, and conservative fusion, fission, and tensor-axis tiling
+    actions. Graph enumeration reruns this pass after every rewrite.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createExtractJointTaskGraphFactsPass()";
+  let dependentDialects = ["mlir::affine::AffineDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::neura::NeuraDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def FissionTask : Pass<"fission-task", "func::FuncOp"> {
+  let summary = "Split one value-only task at a legal pure DFG cut";
+  let constructor = "::mlir::amoeba::neura::createFissionTaskPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::neura::NeuraDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def TileTask : Pass<"tile-task", "func::FuncOp"> {
+  let summary = "Split a static tensor task into k parts along one axis";
+  let constructor = "::mlir::amoeba::neura::createTileTaskPass()";
+  let dependentDialects = ["mlir::affine::AffineDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def ResourceAwareTaskOptimization
     : Pass<"resource-aware-task-optimization", "func::FuncOp"> {
   let summary =

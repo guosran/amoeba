@@ -6,6 +6,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   AnalyticalTaskCostCatalog.cpp
   AnalyzeRecResMiiPass.cpp
   EnumerateAnalyticalTaskCandidatesPass.cpp
+  ExtractJointTaskGraphFactsPass.cpp
   MaterializeAnalyticalTaskCandidatePass.cpp
   MapJointSchedulingTasksPass.cpp
   ScoreAnalyticalTaskCandidatesPass.cpp
