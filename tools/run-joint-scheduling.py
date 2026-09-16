@@ -335,7 +335,7 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
     required_adapters = {
         "extract": ADAPTER_ROOT / "extract_amoeba_task_dfgs.py",
         "features": ADAPTER_ROOT / "generate_amoeba_query_features.py",
-        "catalog": ADAPTER_ROOT / "amoeba_cost_catalog.py",
+        "catalog": ADAPTER_ROOT / "amoeba_reference_cost_catalog.py",
     }
     missing = [str(path) for path in required_adapters.values() if not path.is_file()]
     if missing:
@@ -398,6 +398,7 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
         [sys.executable, str(required_adapters["features"]),
          "--manifest", str(manifest), *task_arguments,
          "--neura-opt", str(amoeba_opt), "--architecture", str(architecture),
+         "--workload-domain", args.workload_domain,
          "--output", str(predictor_input),
          "--timing-output", str(analysis_timing)],
         "analyze-task-shapes", output,
@@ -408,7 +409,13 @@ def run(args: argparse.Namespace) -> Mapping[str, object]:
          "--analytical-input", str(predictor_input), *task_arguments,
          "--output", str(cost_catalog),
          "--timing-output", str(inference_timing),
-         "--device", args.device],
+         "--device", args.device,
+         "--checkpoint", str(_require_file(
+             args.predictor_checkpoint, "predictor checkpoint"
+         )),
+         *(["--allow-provisional-checkpoint"]
+           if args.allow_provisional_checkpoint else []),
+         *(["--allow-test-fixture"] if args.allow_test_fixture else [])],
         "predict-ii", output,
     )
 
@@ -535,6 +542,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="fail instead of publishing a partial manifest above this count",
     )
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument(
+        "--workload-domain", choices=("static_tensor",), required=True,
+        help="explicit predictor scope; the DFG analyzer independently verifies it",
+    )
+    parser.add_argument("--predictor-checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--allow-provisional-checkpoint", action="store_true",
+        help="review-only use of a checkpoint that has not passed promotion",
+    )
+    parser.add_argument(
+        "--allow-test-fixture", action="store_true",
+        help="offline tests only; never a prediction-quality claim",
+    )
     args = parser.parse_args(raw_arguments)
     args.downstream_args = downstream_arguments
     if args.top_k <= 0:

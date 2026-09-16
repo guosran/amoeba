@@ -53,17 +53,20 @@
 // RUN: --architecture-spec=%S/../../../archspec/architecture.yaml \
 // RUN: | FileCheck %s --check-prefix=ANALYTICAL-BOUNDS
 
-// Run the real predictor and heuristic mapper pipeline on this existing FIR
-// workload, materializing only the selected candidate.
+// The reference predictor is tensor-domain only and rejects this dynamic FIR
+// interface before any checkpoint inference or shortlist replay.
 // RUN: rm -rf %t.joint-scheduling
-// RUN: python3 %S/../../../../tools/run-joint-scheduling.py \
+// RUN: not python3 %S/../../../../tools/run-joint-scheduling.py \
 // RUN: %t.dataflow.mlir \
-// RUN: --architecture=%S/../../../archspec/architecture.yaml \
+// RUN: --architecture=%S/../../../archspec/architecture_4x4.yaml \
 // RUN: --amoeba-opt=mlir-amoeba-opt \
+// RUN: --workload-domain=static_tensor \
+// RUN: --predictor-checkpoint=%S/../../../../thirdparty/cgra-ii-predictor/models/reference-candidate/checkpoint.json \
+// RUN: --allow-provisional-checkpoint \
 // RUN: --output-dir=%t.joint-scheduling --top-k=1 -- \
 // RUN: --insert-data-mov \
 // RUN: '--map-to-accelerator=mapping-strategy=heuristic' \
-// RUN: | FileCheck %s --check-prefix=JOINT-SCHEDULING
+// RUN: 2>&1 | FileCheck %s --check-prefix=PREDICTOR-SCOPE
 
 // RUN: mlir-amoeba-opt %s --convert-affine-to-taskflow \
 // RUN: --construct-hyperblock-from-task \
@@ -93,11 +96,7 @@
 
 
 // ANALYTICAL-BOUNDS: module attributes {amoeba.rec_mii = 2 : i32, amoeba.rec_res_mii_info, amoeba.res_mii = 1 : i32}
-// JOINT-SCHEDULING: "full_mapper_status": "completed_single_cgra"
-// JOINT-SCHEDULING: "multi_cgra_full_mapping_supported": false
-// JOINT-SCHEDULING: "candidate_id": "candidate-0"
-// JOINT-SCHEDULING: "shortlist_materialization_invocations": 1
-// JOINT-SCHEDULING: "top_k_requested": 1
+// PREDICTOR-SCOPE: dynamic or unranked tensor/memref shapes are outside predictor scope
 
 module attributes {} {
   func.func @_Z6kernelPiS_S_(%arg0: memref<?xi32>, %arg1: memref<?xi32>, %arg2: memref<?xi32>) -> i32 attributes {llvm.linkage = #llvm.linkage<external>} {
