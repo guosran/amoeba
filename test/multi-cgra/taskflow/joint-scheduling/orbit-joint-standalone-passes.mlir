@@ -20,6 +20,19 @@
 // RUN: ! mlir-amoeba-opt %S/orbit_joint_pipeline_8x8_i32.mlir --verify-each \
 // RUN:   --fuse-reduction-consumer -o /dev/null 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=REJECT-EARLY
+// RUN: mlir-amoeba-opt %S/orbit_joint_pipeline_8x8_i32.mlir --verify-each \
+// RUN:   '--tile-reduction-k-sequential=tile-size=2' \
+// RUN:   '--tile-output-m=tile-size=4' '--tile-output-n=tile-size=4' \
+// RUN:   | FileCheck %s --check-prefix=SEQ-MNK
+// RUN: mlir-amoeba-opt %S/orbit_joint_pipeline_8x8_i32.mlir --verify-each \
+// RUN:   '--tile-reduction-k-sequential=tile-size=2' \
+// RUN:   --fuse-reduction-consumer '--tile-output-m=tile-size=4' \
+// RUN:   '--tile-output-n=tile-size=4' \
+// RUN:   | FileCheck %s --check-prefix=SEQ-MNK-FUSE
+// RUN: sed 's/%writeT: memref<8x8xi32>):/%writeT: memref<8x8xi32>, %extra: memref<8x8xi32>):/' \
+// RUN:   %S/orbit_joint_pipeline_8x8_i32.mlir > %t.bad.mlir
+// RUN: ! mlir-amoeba-opt %t.bad.mlir -o /dev/null 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=BAD-BODY-ARITY
 
 // FUSE: taskflow.task @producer.fuse.consumer
 // FUSE-NOT: taskflow.task @consumer
@@ -51,3 +64,9 @@
 // TREE: taskflow.task @fused.reduction.final.consumer
 
 // REJECT-EARLY: sequential consumer fusion requires a completed final K producer
+// SEQ-MNK: taskflow.task @producer.k.0.tile.0.0.tile.1.0
+// SEQ-MNK: taskflow.task @producer.k.1.tile.0.0.tile.1.0
+// SEQ-MNK: taskflow.task @consumer.tile.0.0.tile.1.0
+// SEQ-MNK-FUSE: taskflow.task @producer.k.0.tile.0.0.tile.1.0
+// SEQ-MNK-FUSE: taskflow.task @fused.producer.k.3.consumer.tile.0.0.tile.1.0
+// BAD-BODY-ARITY: body argument count must match execution inputs

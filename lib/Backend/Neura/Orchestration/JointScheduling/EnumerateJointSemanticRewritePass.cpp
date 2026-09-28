@@ -1449,10 +1449,8 @@ static llvm::json::Object witnessJson(ArrayRef<ActionSpec> history) {
 }
 
 static SmallVector<ActionSpec> actionCatalog(int64_t tileFactor) {
-  // The K and reduction passes are represented in the coordinator's semantic
-  // state space, but remain explicitly pending until their standalone pass
-  // implementations are verified.  Their names and option spelling are still
-  // the stable API consumed by a later materialization stage.
+  // This catalog records pass availability.  actionForHistory checks whether
+  // each available pass can replay at a particular point in an action history.
   SmallVector<ActionSpec> result;
   result.push_back({"FuseProducerConsumer", false, "fuse-producer-consumer", 0,
                     true, "implemented"});
@@ -1487,32 +1485,28 @@ static SmallVector<ActionSpec> actionCatalog(int64_t tileFactor) {
     kFactors = {tileFactor};
   for (int64_t factor : kFactors) {
     bool fullDomain = factor == kDimension;
-    result.push_back(
-        {"TileReductionKSequential", true, "tile-reduction-k-sequential",
-         factor, false,
-         fullDomain ? "tile_size_is_full_domain" : "pending_k_pass"});
+    result.push_back({"TileReductionKSequential", true,
+                      "tile-reduction-k-sequential", factor, !fullDomain,
+                      fullDomain ? "tile_size_is_full_domain" : "implemented"});
   }
   for (int64_t factor : kFactors) {
     bool fullDomain = factor == kDimension;
-    result.push_back(
-        {"TileReductionKParallelLinear", true,
-         "tile-reduction-k-parallel-linear", factor, false,
-         fullDomain ? "tile_size_is_full_domain" : "pending_k_pass"});
+    result.push_back({"TileReductionKParallelLinear", true,
+                      "tile-reduction-k-parallel-linear", factor, !fullDomain,
+                      fullDomain ? "tile_size_is_full_domain" : "implemented"});
   }
   for (int64_t factor : kFactors) {
     bool fullDomain = factor == kDimension;
-    result.push_back(
-        {"TileReductionKParallelTree", true, "tile-reduction-k-parallel-tree",
-         factor, false,
-         fullDomain ? "tile_size_is_full_domain" : "pending_k_pass"});
+    result.push_back({"TileReductionKParallelTree", true,
+                      "tile-reduction-k-parallel-tree", factor, !fullDomain,
+                      fullDomain ? "tile_size_is_full_domain" : "implemented"});
   }
   result.push_back({"FuseTileLocalPair", false, "fuse-tile-local-pair", 0, true,
                     "implemented"});
   result.push_back({"MaterializeNumericReduction", false,
-                    "materialize-numeric-reduction", 0, false,
-                    "pending_k_pass"});
+                    "materialize-numeric-reduction", 0, true, "implemented"});
   result.push_back({"FuseReductionConsumer", false, "fuse-reduction-consumer",
-                    0, false, "pending_k_pass"});
+                    0, true, "implemented"});
   result.push_back({"MaterializeCompletionJoin", false,
                     "materialize-completion-join", 0, true, "implemented"});
   return result;
@@ -1794,7 +1788,12 @@ static ActionSpec actionForHistory(const GraphState &source,
         source.numericReduction && !source.reductionConsumerIntent &&
         (source.fusion == FusionMode::None ||
          source.fusion == FusionMode::ReductionConsumer);
-    if (directUntiled || parallelAfterReduction)
+    bool sequentialAfterK = source.kPolicy == KPolicy::Sequential &&
+                            source.kFactor != 0 && !source.numericReduction &&
+                            !source.reductionConsumerIntent &&
+                            (source.fusion == FusionMode::None ||
+                             source.fusion == FusionMode::SequentialLast);
+    if (directUntiled || parallelAfterReduction || sequentialAfterK)
       implemented();
     else
       pending("pending_output_tiling_order_requires_supported_reduction");

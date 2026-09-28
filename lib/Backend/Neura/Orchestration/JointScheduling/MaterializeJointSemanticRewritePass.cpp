@@ -55,6 +55,7 @@ namespace {
 
 constexpr StringLiteral kSemanticRoleAttr = "amoeba.semantic.task_role";
 constexpr StringLiteral kSemanticKindAttr = "amoeba.semantic.task_kind";
+constexpr StringLiteral kSemanticKRangeAttr = "amoeba.semantic.K_range";
 constexpr StringLiteral kTiledAxesAttr = "amoeba.semantic.tiled_axes";
 constexpr StringLiteral kTileAxisAttr = "amoeba.semantic.tile_axis";
 constexpr StringLiteral kTileSizeAttr = "amoeba.semantic.tile_size";
@@ -603,6 +604,52 @@ static LogicalResult updateSemanticIncomingEdges(func::FuncOp function,
   return success();
 }
 
+static void collectStateProducers(Value value,
+                                  SmallVectorImpl<TaskflowTaskOp> &producers,
+                                  DenseSet<Value> &visited);
+
+static bool provesSequentialKStateCarry(TaskflowTaskOp task) {
+  if (task.getWillReads().size() != 3 ||
+      task.getOriginalReadMemrefs().size() != 3 ||
+      task.getOriginalWriteMemrefs().size() != 1 ||
+      task.getOriginalReadMemrefs()[2] != task.getOriginalWriteMemrefs()[0] ||
+      !task->hasAttr("amoeba.semantic.k_tiled"))
+    return false;
+  auto policy = task->getAttrOfType<StringAttr>("amoeba.semantic.k_policy");
+  auto index =
+      task->getAttrOfType<IntegerAttr>("amoeba.semantic.k_block_index");
+  auto count =
+      task->getAttrOfType<IntegerAttr>("amoeba.semantic.k_block_count");
+  auto kRange = task->getAttrOfType<DenseI64ArrayAttr>(kSemanticKRangeAttr);
+  if (!policy || policy.getValue() != "sequential" || !index || !count ||
+      index.getInt() <= 0 || index.getInt() >= count.getInt() || !kRange ||
+      kRange.asArrayRef().size() != 2 ||
+      kRange.asArrayRef()[0] >= kRange.asArrayRef()[1])
+    return false;
+  SmallVector<TaskflowTaskOp> predecessors;
+  DenseSet<Value> visited;
+  collectStateProducers(task.getWillReads()[2], predecessors, visited);
+  if (predecessors.empty())
+    return false;
+  for (TaskflowTaskOp predecessor : predecessors) {
+    auto previousIndex = predecessor->getAttrOfType<IntegerAttr>(
+        "amoeba.semantic.k_block_index");
+    auto previousCount = predecessor->getAttrOfType<IntegerAttr>(
+        "amoeba.semantic.k_block_count");
+    auto previousRange =
+        predecessor->getAttrOfType<DenseI64ArrayAttr>(kSemanticKRangeAttr);
+    if (!previousIndex || previousIndex.getInt() + 1 != index.getInt() ||
+        !previousCount || previousCount.getInt() != count.getInt() ||
+        !previousRange || previousRange.asArrayRef().size() != 2 ||
+        previousRange.asArrayRef()[1] != kRange.asArrayRef()[0] ||
+        predecessor.getOriginalWriteMemrefs().size() != 1 ||
+        predecessor.getOriginalWriteMemrefs()[0] !=
+            task.getOriginalWriteMemrefs()[0])
+      return false;
+  }
+  return true;
+}
+
 static bool taskHasCanonicalStateShape(TaskflowTaskOp task) {
   if (!task || !task.getBody().hasOneBlock() ||
       task.getDoneWrites().size() != 1 || task.getWillWrites().size() != 1 ||
@@ -645,9 +692,12 @@ static bool taskHasCanonicalStateShape(TaskflowTaskOp task) {
   for (auto [state, root] : llvm::zip(states, roots))
     if (state.getType() != root.getType())
       return false;
+  bool provenStateCarry = provesSequentialKStateCarry(task);
   for (size_t first = 0; first < roots.size(); ++first)
     for (size_t second = first + 1; second < roots.size(); ++second)
-      if (!provesDistinctStorage(roots[first], roots[second]))
+      if (!provesDistinctStorage(roots[first], roots[second]) &&
+          !(provenStateCarry && first == 2 && second + 1 == roots.size() &&
+            roots[first] == roots[second]))
         return false;
   return true;
 }

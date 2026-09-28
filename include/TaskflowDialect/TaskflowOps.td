@@ -77,6 +77,7 @@ def TaskflowTaskOp
   let regions = (region SizedRegion<1>:$body);
 
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 // Defines the yield operation to terminate a Taskflow task.

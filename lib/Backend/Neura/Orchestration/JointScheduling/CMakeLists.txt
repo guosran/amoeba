@@ -9,6 +9,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   EnumerateJointSemanticRewritePass.cpp
   MaterializeJointSemanticRewritePass.cpp
   JointReductionRewritePasses.cpp
+  LowerJointTaskflowForHostPass.cpp
   ExtractJointTaskGraphFactsPass.cpp
   MaterializeAnalyticalTaskCandidatePass.cpp
   MapJointSchedulingTasksPass.cpp

@@ -42,6 +42,7 @@ std::unique_ptr<Pass> createFuseTileLocalPairPass();
 std::unique_ptr<Pass> createFuseReductionConsumerPass();
 std::unique_ptr<Pass> createMaterializeNumericReductionPass();
 std::unique_ptr<Pass> createMaterializeCompletionJoinPass();
+std::unique_ptr<Pass> createLowerJointTaskflowToHostSCFPass();
 std::unique_ptr<Pass> createFuseTaskPass();
 std::unique_ptr<Pass> createFissionTaskPass();
 std::unique_ptr<Pass> createTileTaskPass();

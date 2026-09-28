@@ -384,6 +384,27 @@ def MaterializeCompletionJoin
                            "mlir::taskflow::TaskflowDialect"];
 }
 
+def LowerJointTaskflowToHostSCF
+    : Pass<"lower-joint-taskflow-to-host-scf", "ModuleOp"> {
+  let summary = "Lower executable ORBIT Taskflow graphs to host SCF";
+  let description = [{
+    Inlines dependency-ordered Taskflow bodies, lowers static or dynamic
+    counters to nested scf.for operations, and aliases completion joins only
+    after the Taskflow verifier proves their region coverage. Unsupported
+    bodies and operations are rejected without publishing a partial lowering.
+  }];
+  let options = [Option<
+      "functionName", "function", "std::string", /*default=*/"\"\"",
+      "Only lower this function; empty lowers every Taskflow function.">];
+  let constructor =
+      "::mlir::amoeba::neura::createLowerJointTaskflowToHostSCFPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def FissionTask : Pass<"fission-task", "func::FuncOp"> {
   let summary = "Split one value-only task at a legal pure DFG cut";
   let constructor = "::mlir::amoeba::neura::createFissionTaskPass()";

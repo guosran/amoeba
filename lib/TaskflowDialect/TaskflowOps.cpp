@@ -58,6 +58,28 @@ stateRegion(Value state, Value expectedBase) {
 
 } // namespace
 
+LogicalResult TaskflowTaskOp::verify() {
+  if (!getBody().hasOneBlock())
+    return emitOpError("requires exactly one body block");
+  Block &body = getBody().front();
+  SmallVector<Value> inputs(getWillReads());
+  inputs.append(getWillWrites().begin(), getWillWrites().end());
+  inputs.append(getValueInputs().begin(), getValueInputs().end());
+  if (body.getNumArguments() != inputs.size())
+    return emitOpError("body argument count must match execution inputs; "
+                       "original memrefs are provenance only");
+  for (auto [argument, input] : llvm::zip(body.getArguments(), inputs))
+    if (argument.getType() != input.getType())
+      return emitOpError("body argument type does not match execution input");
+  auto yield = dyn_cast<TaskflowYieldOp>(body.getTerminator());
+  if (!yield || yield->getNumOperands() != getNumResults())
+    return emitOpError("yield arity must match task results");
+  for (auto [result, yielded] : llvm::zip(getResults(), yield->getOperands()))
+    if (result.getType() != yielded.getType())
+      return emitOpError("yield type does not match task result");
+  return success();
+}
+
 LogicalResult TaskflowJoinOp::verify() {
   if (getTileStates().size() < 2)
     return emitOpError("requires at least two tile states");

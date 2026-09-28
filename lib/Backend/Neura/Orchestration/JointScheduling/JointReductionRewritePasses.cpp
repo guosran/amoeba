@@ -1004,7 +1004,12 @@ cloneSequentialProducer(OpBuilder &builder, const SourcePipeline &sourceInfo,
       TypeRange{}, reads, ValueRange{outputRoot}, ValueRange{},
       builder.getStringAttr(name), roots, ValueRange{outputRoot});
   Block *body = &task.getBody().emplaceBlock();
-  for (Value operand : task->getOperands())
+  // original_*_memrefs are provenance operands, not task body parameters.
+  for (Value operand : task.getWillReads())
+    body->addArgument(operand.getType(), source.getLoc());
+  for (Value operand : task.getWillWrites())
+    body->addArgument(operand.getType(), source.getLoc());
+  for (Value operand : task.getValueInputs())
     body->addArgument(operand.getType(), source.getLoc());
 
   IRMapping mapping;
