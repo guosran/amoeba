@@ -257,6 +257,133 @@ def ExtractJointTaskGraphFacts
                            "mlir::taskflow::TaskflowDialect"];
 }
 
+def EnumerateJointSemanticRewrite
+    : Pass<"enumerate-joint-semantic-rewrites", "ModuleOp"> {
+  let summary = "Enumerate source-bound Taskflow tiling and fusion graph rewrites";
+  let description = [{
+    Recognizes a static producer-consumer Taskflow program and publishes a
+    deterministic, hardware-independent graph rewrite DAG. Legalization and
+    candidate identity are owned by this MLIR pass.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createEnumerateJointSemanticRewritePass()";
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def MaterializeJointSemanticRewrite
+    : Pass<"materialize-joint-semantic-rewrite", "ModuleOp"> {
+  let summary = "Materialize a selected source-bound Taskflow graph rewrite";
+  let description = [{
+    Applies a selected hardware-independent M/N/K task tiling and graph
+    fusion candidate to Taskflow IR after source and legality validation.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createMaterializeJointSemanticRewritePass()";
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def TileOutputM : Pass<"tile-output-m", "ModuleOp"> {
+  let summary = "Tile a source-bound Taskflow output along M";
+  let constructor = "::mlir::amoeba::neura::createTileOutputMPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def TileOutputN : Pass<"tile-output-n", "ModuleOp"> {
+  let summary = "Tile a source-bound Taskflow output along N";
+  let constructor = "::mlir::amoeba::neura::createTileOutputNPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def TileReductionKSequential
+    : Pass<"tile-reduction-k-sequential", "ModuleOp"> {
+  let summary = "Split K into sequential Taskflow state-carry blocks";
+  let constructor =
+      "::mlir::amoeba::neura::createTileReductionKSequentialPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def TileReductionKParallelLinear
+    : Pass<"tile-reduction-k-parallel-linear", "ModuleOp"> {
+  let summary = "Split K into private partials with linear reduction topology";
+  let constructor =
+      "::mlir::amoeba::neura::createTileReductionKParallelLinearPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def TileReductionKParallelTree
+    : Pass<"tile-reduction-k-parallel-tree", "ModuleOp"> {
+  let summary = "Split K into private partials with balanced-tree topology";
+  let constructor =
+      "::mlir::amoeba::neura::createTileReductionKParallelTreePass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def FuseProducerConsumer
+    : Pass<"fuse-producer-consumer", "ModuleOp"> {
+  let summary = "Fuse a proven Taskflow producer-consumer pair";
+  let constructor =
+      "::mlir::amoeba::neura::createFuseProducerConsumerPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def FuseTileLocalPair : Pass<"fuse-tile-local-pair", "ModuleOp"> {
+  let summary = "Fuse corresponding producer-consumer output tiles";
+  let constructor = "::mlir::amoeba::neura::createFuseTileLocalPairPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def FuseReductionConsumer
+    : Pass<"fuse-reduction-consumer", "ModuleOp"> {
+  let summary = "Fuse a completed numeric reduction with its consumer";
+  let constructor =
+      "::mlir::amoeba::neura::createFuseReductionConsumerPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def MaterializeNumericReduction
+    : Pass<"materialize-numeric-reduction", "ModuleOp"> {
+  let summary = "Materialize a numeric reduction over private K partials";
+  let constructor =
+      "::mlir::amoeba::neura::createMaterializeNumericReductionPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def MaterializeCompletionJoin
+    : Pass<"materialize-completion-join", "ModuleOp"> {
+  let summary = "Join disjoint Taskflow completion states without arithmetic";
+  let constructor =
+      "::mlir::amoeba::neura::createMaterializeCompletionJoinPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def FissionTask : Pass<"fission-task", "func::FuncOp"> {
   let summary = "Split one value-only task at a legal pure DFG cut";
   let constructor = "::mlir::amoeba::neura::createFissionTaskPass()";

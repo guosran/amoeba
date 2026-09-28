@@ -7,7 +7,6 @@
 
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 
@@ -38,13 +37,14 @@ struct EdgeIdentity {
   uint32_t producer_index = 0;
   TaskOperandSegment consumer_segment = TaskOperandSegment::Control;
   uint32_t consumer_index = 0;
+  TaskEdgeOrigin origin = TaskEdgeOrigin::Taskflow;
 
   bool operator<(const EdgeIdentity &other) const {
     return std::tie(producer_task, consumer_task, kind, producer_segment,
-                    producer_index, consumer_segment, consumer_index) <
+                    producer_index, consumer_segment, consumer_index, origin) <
            std::tie(other.producer_task, other.consumer_task, other.kind,
                     other.producer_segment, other.producer_index,
-                    other.consumer_segment, other.consumer_index);
+                    other.consumer_segment, other.consumer_index, other.origin);
   }
 };
 
@@ -53,6 +53,21 @@ struct ProducerResult {
   TaskResultSegment segment = TaskResultSegment::None;
   uint32_t index = 0;
   Value value;
+};
+
+struct StaticRegion {
+  SmallVector<int64_t> lower;
+  SmallVector<int64_t> upper;
+};
+
+struct ProducerWriteRegion {
+  Value base;
+  StaticRegion region;
+};
+
+struct ConsumerInputRegion {
+  bool descriptor_present = false;
+  std::optional<StaticRegion> region;
 };
 
 std::optional<ProducerResult>
@@ -139,6 +154,281 @@ collectProducerResults(Value value,
   return success();
 }
 
+TaskflowJoinOp findForwardedJoin(Value value) {
+  while (auto channel = value.getDefiningOp<TaskflowChannelOp>())
+    value = channel.getSource();
+  return value.getDefiningOp<TaskflowJoinOp>();
+}
+
+bool validateRegion(const StaticRegion &region, ShapedType type) {
+  if (!type.hasStaticShape() ||
+      region.lower.size() != static_cast<size_t>(type.getRank()) ||
+      region.upper.size() != region.lower.size())
+    return false;
+  for (int64_t dimension = 0; dimension < type.getRank(); ++dimension)
+    if (region.lower[dimension] < 0 ||
+        region.upper[dimension] <= region.lower[dimension] ||
+        region.upper[dimension] > type.getShape()[dimension])
+      return false;
+  return true;
+}
+
+std::optional<ProducerWriteRegion>
+getProducerWriteRegion(ProducerResult producer) {
+  if (producer.segment != TaskResultSegment::DoneWrites ||
+      !producer.task.getBody().hasOneBlock())
+    return std::nullopt;
+  auto type = dyn_cast<ShapedType>(producer.value.getType());
+  auto taskYield = dyn_cast<TaskflowYieldOp>(
+      producer.task.getBody().front().getTerminator());
+  if (!type || !taskYield || producer.index >= taskYield.getDoneWrites().size())
+    return std::nullopt;
+  auto argument =
+      dyn_cast<BlockArgument>(taskYield.getDoneWrites()[producer.index]);
+  unsigned firstWrite = producer.task.getWillReads().size();
+  if (!argument || argument.getOwner() != &producer.task.getBody().front() ||
+      argument.getArgNumber() < firstWrite)
+    return std::nullopt;
+  unsigned writeIndex = argument.getArgNumber() - firstWrite;
+  size_t outputCount = producer.task.getWillWrites().size();
+  auto lowers =
+      producer.task->getAttrOfType<ArrayAttr>(kTilingOutputRegionLowersAttr);
+  auto uppers =
+      producer.task->getAttrOfType<ArrayAttr>(kTilingOutputRegionUppersAttr);
+  if (writeIndex >= outputCount || !lowers || !uppers ||
+      lowers.size() != outputCount || uppers.size() != outputCount ||
+      producer.task.getOriginalWriteMemrefs().size() != outputCount)
+    return std::nullopt;
+  auto lower = dyn_cast<DenseI64ArrayAttr>(lowers[writeIndex]);
+  auto upper = dyn_cast<DenseI64ArrayAttr>(uppers[writeIndex]);
+  if (!lower || !upper)
+    return std::nullopt;
+  StaticRegion region{SmallVector<int64_t>(lower.asArrayRef()),
+                      SmallVector<int64_t>(upper.asArrayRef())};
+  if (!validateRegion(region, type))
+    return std::nullopt;
+  return ProducerWriteRegion{
+      producer.task.getOriginalWriteMemrefs()[writeIndex], std::move(region)};
+}
+
+// The dependence-state SSA value yielded by a producer is not itself the
+// original memref identity recorded on the consumer.  In particular, a
+// materialized private partial buffer is yielded by the producer and threaded
+// directly into the consumer, while the consumer's original_read_memrefs may
+// still name that yielded state.  Resolve those state values back to the
+// original write/read operand so region proofs compare storage roots rather
+// than incidental SSA versions.
+static FailureOr<Value> resolveOriginalMemrefRoot(Value value,
+                                                  DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return failure();
+  if (auto channel = value.getDefiningOp<TaskflowChannelOp>())
+    return resolveOriginalMemrefRoot(channel.getSource(), visited);
+  if (auto join = value.getDefiningOp<TaskflowJoinOp>())
+    return join.getBase();
+  auto task = value.getDefiningOp<TaskflowTaskOp>();
+  if (!task)
+    return value;
+  auto yield =
+      dyn_cast<TaskflowYieldOp>(task.getBody().front().getTerminator());
+  if (!yield)
+    return failure();
+  auto resolveSegment = [&](ValueRange results, ValueRange originals,
+                            bool requireWrite) -> FailureOr<Value> {
+    auto result = llvm::find(results, value);
+    if (result == results.end())
+      return failure();
+    unsigned index = result - results.begin();
+    if (requireWrite) {
+      if (index >= yield.getDoneWrites().size() || index >= originals.size())
+        return failure();
+      auto argument = dyn_cast<BlockArgument>(yield.getDoneWrites()[index]);
+      unsigned firstWrite = task.getWillReads().size();
+      if (!argument || argument.getOwner() != &task.getBody().front() ||
+          argument.getArgNumber() < firstWrite ||
+          argument.getArgNumber() >= firstWrite + task.getWillWrites().size())
+        return failure();
+      unsigned writeIndex = argument.getArgNumber() - firstWrite;
+      if (writeIndex >= originals.size())
+        return failure();
+      return resolveOriginalMemrefRoot(originals[writeIndex], visited);
+    }
+    if (index >= yield.getDoneReads().size() || index >= originals.size())
+      return failure();
+    return resolveOriginalMemrefRoot(originals[index], visited);
+  };
+  if (auto root = resolveSegment(task.getDoneWrites(),
+                                 task.getOriginalWriteMemrefs(), true);
+      succeeded(root))
+    return *root;
+  if (auto root = resolveSegment(task.getDoneReads(),
+                                 task.getOriginalReadMemrefs(), false);
+      succeeded(root))
+    return *root;
+  return failure();
+}
+
+static bool matchingOriginalMemrefRoot(Value producerRoot, Value consumerRoot) {
+  DenseSet<Value> producerVisited;
+  DenseSet<Value> consumerVisited;
+  FailureOr<Value> resolvedProducer =
+      resolveOriginalMemrefRoot(producerRoot, producerVisited);
+  FailureOr<Value> resolvedConsumer =
+      resolveOriginalMemrefRoot(consumerRoot, consumerVisited);
+  return succeeded(resolvedProducer) && succeeded(resolvedConsumer) &&
+         *resolvedProducer == *resolvedConsumer;
+}
+
+FailureOr<ConsumerInputRegion> getConsumerInputRegion(TaskflowTaskOp consumer,
+                                                      uint32_t inputIndex,
+                                                      std::string &error) {
+  auto lowers =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionLowersAttr);
+  auto uppers =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionUppersAttr);
+  auto reasons =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionReasonsAttr);
+  if (!lowers && !uppers && !reasons)
+    return ConsumerInputRegion{};
+  size_t inputCount = consumer.getWillReads().size();
+  if (!lowers || !uppers || !reasons || lowers.size() != inputCount ||
+      uppers.size() != inputCount || reasons.size() != inputCount ||
+      consumer.getOriginalReadMemrefs().size() != inputCount ||
+      inputIndex >= inputCount) {
+    error = "tiled input-region descriptors must contain one lower, upper, "
+            "and reason entry per will_reads operand";
+    return failure();
+  }
+  if (!isa<StringAttr>(reasons[inputIndex])) {
+    error = "tiled input-region reasons must be string attributes";
+    return failure();
+  }
+  bool unknownLower = isa<UnitAttr>(lowers[inputIndex]);
+  bool unknownUpper = isa<UnitAttr>(uppers[inputIndex]);
+  if (unknownLower || unknownUpper) {
+    if (!unknownLower || !unknownUpper) {
+      error = "an unknown tiled input region requires unit lower and upper "
+              "entries";
+      return failure();
+    }
+    return ConsumerInputRegion{/*descriptor_present=*/true, std::nullopt};
+  }
+  auto lower = dyn_cast<DenseI64ArrayAttr>(lowers[inputIndex]);
+  auto upper = dyn_cast<DenseI64ArrayAttr>(uppers[inputIndex]);
+  auto type =
+      dyn_cast<ShapedType>(consumer.getWillReads()[inputIndex].getType());
+  if (!lower || !upper || !type) {
+    error = "known tiled input regions require shaped operands and dense "
+            "integer bounds";
+    return failure();
+  }
+  StaticRegion region{SmallVector<int64_t>(lower.asArrayRef()),
+                      SmallVector<int64_t>(upper.asArrayRef())};
+  if (!validateRegion(region, type)) {
+    error = "tiled input region is outside its static operand shape";
+    return failure();
+  }
+  return ConsumerInputRegion{/*descriptor_present=*/true, std::move(region)};
+}
+
+std::optional<StaticRegion> intersectRegions(const StaticRegion &lhs,
+                                             const StaticRegion &rhs) {
+  if (lhs.lower.size() != rhs.lower.size())
+    return std::nullopt;
+  StaticRegion intersection;
+  for (size_t dimension = 0; dimension < lhs.lower.size(); ++dimension) {
+    int64_t lower = std::max(lhs.lower[dimension], rhs.lower[dimension]);
+    int64_t upper = std::min(lhs.upper[dimension], rhs.upper[dimension]);
+    if (upper <= lower)
+      return std::nullopt;
+    intersection.lower.push_back(lower);
+    intersection.upper.push_back(upper);
+  }
+  return intersection;
+}
+
+bool isContainedIn(const StaticRegion &inner, ArrayRef<int64_t> outerLower,
+                   ArrayRef<int64_t> outerUpper) {
+  if (inner.lower.size() != outerLower.size() ||
+      inner.upper.size() != outerUpper.size())
+    return false;
+  for (size_t dimension = 0; dimension < inner.lower.size(); ++dimension)
+    if (inner.lower[dimension] < outerLower[dimension] ||
+        inner.upper[dimension] > outerUpper[dimension])
+      return false;
+  return true;
+}
+
+FailureOr<StaticRegion> getOriginalAccessRegion(TaskflowTaskOp task,
+                                                Value memory, bool write) {
+  ValueRange roots =
+      write ? task.getOriginalWriteMemrefs() : task.getOriginalReadMemrefs();
+  auto found = llvm::find(roots, memory);
+  if (found == roots.end() ||
+      std::find(std::next(found), roots.end(), memory) != roots.end())
+    return failure();
+  unsigned index = found - roots.begin();
+  StringRef lowerName =
+      write ? kTilingOutputRegionLowersAttr : kTilingInputRegionLowersAttr;
+  StringRef upperName =
+      write ? kTilingOutputRegionUppersAttr : kTilingInputRegionUppersAttr;
+  auto lowers = task->getAttrOfType<ArrayAttr>(lowerName);
+  auto uppers = task->getAttrOfType<ArrayAttr>(upperName);
+  if (!lowers || !uppers || lowers.size() != roots.size() ||
+      uppers.size() != roots.size())
+    return failure();
+  auto lower = dyn_cast<DenseI64ArrayAttr>(lowers[index]);
+  auto upper = dyn_cast<DenseI64ArrayAttr>(uppers[index]);
+  auto type = dyn_cast<ShapedType>(memory.getType());
+  if (!lower || !upper || !type)
+    return failure();
+  StaticRegion region{SmallVector<int64_t>(lower.asArrayRef()),
+                      SmallVector<int64_t>(upper.asArrayRef())};
+  if (!validateRegion(region, type))
+    return failure();
+  return region;
+}
+
+bool haveDisjointAccessRegions(TaskflowTaskOp writer, TaskflowTaskOp other,
+                               bool otherReads, bool otherWrites,
+                               Value memory) {
+  FailureOr<StaticRegion> writerRegion =
+      getOriginalAccessRegion(writer, memory, /*write=*/true);
+  if (failed(writerRegion))
+    return false;
+  auto disjoint = [](const StaticRegion &lhs, const StaticRegion &rhs) {
+    if (lhs.lower.size() != rhs.lower.size() ||
+        lhs.upper.size() != lhs.lower.size() ||
+        rhs.upper.size() != lhs.lower.size())
+      return false;
+    for (size_t dimension = 0; dimension < lhs.lower.size(); ++dimension)
+      if (lhs.upper[dimension] <= rhs.lower[dimension] ||
+          rhs.upper[dimension] <= lhs.lower[dimension])
+        return true;
+    return false;
+  };
+  if (otherReads) {
+    FailureOr<StaticRegion> readRegion =
+        getOriginalAccessRegion(other, memory, /*write=*/false);
+    if (failed(readRegion) || !disjoint(*writerRegion, *readRegion))
+      return false;
+  }
+  if (otherWrites) {
+    FailureOr<StaticRegion> writeRegion =
+        getOriginalAccessRegion(other, memory, /*write=*/true);
+    if (failed(writeRegion) || !disjoint(*writerRegion, *writeRegion))
+      return false;
+  }
+  return true;
+}
+
+std::optional<uint32_t> firstMemoryIndex(ValueRange values, Value memory) {
+  auto found = llvm::find(values, memory);
+  if (found == values.end())
+    return std::nullopt;
+  return static_cast<uint32_t>(found - values.begin());
+}
+
 std::optional<uint64_t> getScalarBitWidth(Type type) {
   if (auto integer = dyn_cast<IntegerType>(type)) {
     unsigned width = integer.getWidth();
@@ -179,57 +469,91 @@ std::optional<uint64_t> getTypePayloadBits(Type type) {
   return static_cast<uint64_t>(element_count) * *element_width;
 }
 
-std::optional<int64_t> constantIndex(Value value) {
-  if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
-    return constant.value();
-  return std::nullopt;
+enum class PayloadSource : uint8_t {
+  Unknown,
+  StaticType,
+  ProvenTiledRegion,
+  Explicit,
+};
+
+struct PayloadFact {
+  std::optional<uint64_t> bits;
+  PayloadSource source = PayloadSource::Unknown;
+};
+
+struct ExplicitPayloadFact {
+  bool present = false;
+  std::optional<uint64_t> bits;
+};
+
+PayloadFact getProducerPayloadFact(ProducerResult producer) {
+  auto shaped = dyn_cast<ShapedType>(producer.value.getType());
+  if (!shaped || producer.segment != TaskResultSegment::DoneWrites) {
+    std::optional<uint64_t> bits = getTypePayloadBits(producer.value.getType());
+    return {bits, bits ? PayloadSource::StaticType : PayloadSource::Unknown};
+  }
+  if (!shaped.hasStaticShape())
+    return {};
+  bool hasTiledRegion = producer.task->hasAttr(kTilingOutputRegionLowersAttr) ||
+                        producer.task->hasAttr(kTilingOutputRegionUppersAttr);
+  if (hasTiledRegion) {
+    std::optional<ProducerWriteRegion> writeRegion =
+        getProducerWriteRegion(producer);
+    if (!writeRegion)
+      return {};
+    uint64_t elements = 1;
+    for (int64_t dimension = 0; dimension < shaped.getRank(); ++dimension) {
+      uint64_t extent =
+          static_cast<uint64_t>(writeRegion->region.upper[dimension] -
+                                writeRegion->region.lower[dimension]);
+      if (elements > UINT64_MAX / extent)
+        return {};
+      elements *= extent;
+    }
+    std::optional<uint64_t> elementBits =
+        getTypePayloadBits(shaped.getElementType());
+    if (!elementBits || elements > UINT64_MAX / *elementBits)
+      return {};
+    return {elements * *elementBits, PayloadSource::ProvenTiledRegion};
+  }
+
+  // Without a compiler-proven tiled region, counter bounds say nothing about
+  // which output elements are actually transferred.  The only sound static
+  // fact is the complete shaped value; a narrower transfer needs an explicit
+  // consumer contract.
+  std::optional<uint64_t> bits = getTypePayloadBits(producer.value.getType());
+  return {bits, bits ? PayloadSource::StaticType : PayloadSource::Unknown};
 }
 
-std::optional<uint64_t> getProducerPayloadBits(ProducerResult producer) {
-  auto shaped = dyn_cast<ShapedType>(producer.value.getType());
-  if (!shaped || producer.segment != TaskResultSegment::DoneWrites)
-    return getTypePayloadBits(producer.value.getType());
-  if (!shaped.hasStaticShape())
-    return std::nullopt;
-
-  SmallVector<TaskflowCounterOp> counters;
-  for (Operation &operation : producer.task.getBody().front())
-    if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
-      counters.push_back(counter);
-  if (counters.size() != static_cast<size_t>(shaped.getRank()))
-    return getTypePayloadBits(producer.value.getType());
-
+PayloadFact getRegionPayloadFact(Type valueType, const StaticRegion &region) {
+  auto shaped = dyn_cast<ShapedType>(valueType);
+  if (!shaped || !validateRegion(region, shaped))
+    return {};
   uint64_t elements = 1;
-  for (auto [axis, counter] : llvm::enumerate(counters)) {
-    std::optional<int64_t> lower = constantIndex(counter.getLowerBound());
-    std::optional<int64_t> upper = constantIndex(counter.getUpperBound());
-    std::optional<int64_t> step = constantIndex(counter.getStep());
-    if (!lower || !upper || !step || *step != 1 || *lower < 0 ||
-        *upper <= *lower || *upper > shaped.getShape()[axis])
-      return std::nullopt;
-    uint64_t extent = static_cast<uint64_t>(*upper - *lower);
+  for (size_t dimension = 0; dimension < region.lower.size(); ++dimension) {
+    uint64_t extent = static_cast<uint64_t>(region.upper[dimension] -
+                                            region.lower[dimension]);
     if (elements > UINT64_MAX / extent)
-      return std::nullopt;
+      return {};
     elements *= extent;
   }
   std::optional<uint64_t> elementBits =
       getTypePayloadBits(shaped.getElementType());
   if (!elementBits || elements > UINT64_MAX / *elementBits)
-    return std::nullopt;
-  return elements * *elementBits;
+    return {};
+  return {elements * *elementBits, PayloadSource::ProvenTiledRegion};
 }
 
-std::optional<uint64_t> getExplicitPayloadBits(TaskflowTaskOp consumer,
-                                               TaskOperandSegment segment,
-                                               uint32_t index,
-                                               std::string &error) {
+ExplicitPayloadFact getExplicitPayloadBits(TaskflowTaskOp consumer,
+                                           TaskOperandSegment segment,
+                                           uint32_t index, std::string &error) {
   auto attribute = consumer->getAttr(kEdgePayloadBitsAttr);
   if (!attribute)
-    return std::nullopt;
+    return {};
   auto payload_bits = dyn_cast<DenseI64ArrayAttr>(attribute);
   if (!payload_bits) {
     error = "amoeba.edge_payload_bits must be a DenseI64ArrayAttr";
-    return std::nullopt;
+    return {true, std::nullopt};
   }
 
   size_t read_count = consumer.getWillReads().size();
@@ -237,12 +561,12 @@ std::optional<uint64_t> getExplicitPayloadBits(TaskflowTaskOp consumer,
   if (payload_bits.asArrayRef().size() != read_count + value_count) {
     error = "amoeba.edge_payload_bits must contain one entry for every "
             "will_reads and value_inputs operand";
-    return std::nullopt;
+    return {true, std::nullopt};
   }
   if (segment != TaskOperandSegment::WillReads &&
       segment != TaskOperandSegment::ValueInputs) {
     error = "payload facts are only valid for data-carrying operands";
-    return std::nullopt;
+    return {true, std::nullopt};
   }
   size_t payload_index = index;
   if (segment == TaskOperandSegment::ValueInputs)
@@ -250,11 +574,11 @@ std::optional<uint64_t> getExplicitPayloadBits(TaskflowTaskOp consumer,
   int64_t bits = payload_bits[payload_index];
   if (bits < -1) {
     error = "amoeba.edge_payload_bits entries must be non-negative or -1";
-    return std::nullopt;
+    return {true, std::nullopt};
   }
   if (bits == -1)
-    return std::nullopt;
-  return static_cast<uint64_t>(bits);
+    return {true, std::nullopt};
+  return {true, static_cast<uint64_t>(bits)};
 }
 
 bool validateExplicitPayloadBits(TaskflowTaskOp consumer, std::string &error) {
@@ -302,6 +626,28 @@ StringRef stringifyTaskEdgeKind(TaskEdgeKind kind) {
     return "control";
   }
   llvm_unreachable("unknown task edge kind");
+}
+
+StringRef stringifyTaskEdgeOrigin(TaskEdgeOrigin origin) {
+  switch (origin) {
+  case TaskEdgeOrigin::Taskflow:
+    return "taskflow";
+  case TaskEdgeOrigin::MemoryOrder:
+    return "memory_order";
+  case TaskEdgeOrigin::Control:
+    return "control";
+  }
+  llvm_unreachable("unknown task edge origin");
+}
+
+StringRef stringifyTaskEdgeScope(TaskEdgeScope scope) {
+  switch (scope) {
+  case TaskEdgeScope::TensorWide:
+    return "tensor_wide";
+  case TaskEdgeScope::TileLocal:
+    return "tile_local";
+  }
+  llvm_unreachable("unknown task edge scope");
 }
 
 StringRef stringifyTaskOperandSegment(TaskOperandSegment segment) {
@@ -355,10 +701,12 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
   }
 
   std::set<EdgeIdentity> identities;
-  auto addEdge = [&](ProducerResult producer, TaskflowTaskOp consumer,
-                     TaskEdgeKind kind, TaskOperandSegment consumer_segment,
-                     uint32_t consumer_index,
-                     std::optional<uint64_t> payload) -> bool {
+  auto addEdge =
+      [&](ProducerResult producer, TaskflowTaskOp consumer, TaskEdgeKind kind,
+          TaskOperandSegment consumer_segment, uint32_t consumer_index,
+          std::optional<uint64_t> payload, TaskEdgeOrigin origin,
+          TaskEdgeScope scope,
+          const std::optional<StaticRegion> &transferRegion) -> bool {
     unsigned producer_id = task_ids.lookup(producer.task.getOperation());
     unsigned consumer_id = task_ids.lookup(consumer.getOperation());
     if (producer_id == consumer_id) {
@@ -367,19 +715,27 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
     }
     EdgeIdentity identity{producer_id,      consumer_id,    kind,
                           producer.segment, producer.index, consumer_segment,
-                          consumer_index};
+                          consumer_index,   origin};
     if (!identities.insert(identity).second) {
       error = "duplicate task edge identity";
       return false;
     }
-    if ((kind == TaskEdgeKind::Value || kind == TaskEdgeKind::Raw) &&
+    if (origin == TaskEdgeOrigin::Taskflow &&
+        (kind == TaskEdgeKind::Value || kind == TaskEdgeKind::Raw) &&
         !payload && options.require_payload) {
       error = "data-carrying task edge has unknown payload size";
       return false;
     }
+    SmallVector<int64_t> transferLower;
+    SmallVector<int64_t> transferUpper;
+    if (transferRegion) {
+      transferLower = transferRegion->lower;
+      transferUpper = transferRegion->upper;
+    }
     graph.edges_.push_back({producer.task, consumer, kind, producer.segment,
                             producer.index, consumer_segment, consumer_index,
-                            payload});
+                            origin, scope, std::move(transferLower),
+                            std::move(transferUpper), payload});
     return true;
   };
 
@@ -387,6 +743,14 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
                              TaskOperandSegment operand_segment,
                              TaskEdgeKind expected_kind) -> bool {
     for (auto indexed : llvm::enumerate(values)) {
+      ConsumerInputRegion consumerRegion;
+      if (operand_segment == TaskOperandSegment::WillReads) {
+        FailureOr<ConsumerInputRegion> parsedRegion =
+            getConsumerInputRegion(consumer, indexed.index(), error);
+        if (failed(parsedRegion))
+          return false;
+        consumerRegion = std::move(*parsedRegion);
+      }
       SmallVector<ProducerResult> producers;
       DenseSet<Value> visited;
       if (failed(collectProducerResults(
@@ -396,16 +760,90 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
       if (producers.empty())
         continue;
 
+      SmallVector<std::optional<StaticRegion>> transferRegions(
+          producers.size());
+      bool tileLocal = false;
+      TaskflowJoinOp join = findForwardedJoin(indexed.value());
+      if (operand_segment == TaskOperandSegment::WillReads &&
+          consumerRegion.region &&
+          indexed.index() < consumer.getOriginalReadMemrefs().size() &&
+          producers.size() == 1 && !join) {
+        // A direct done_writes -> will_reads edge is tile-local only when the
+        // producer's explicit output region and the consumer's per-operand
+        // input region refer to the same original memref root.  Unknown or
+        // mismatched provenance deliberately falls through to tensor-wide.
+        std::optional<ProducerWriteRegion> writeRegion =
+            getProducerWriteRegion(producers.front());
+        Value consumerRoot = consumer.getOriginalReadMemrefs()[indexed.index()];
+        if (writeRegion &&
+            matchingOriginalMemrefRoot(writeRegion->base, consumerRoot)) {
+          std::optional<StaticRegion> intersection =
+              intersectRegions(writeRegion->region, *consumerRegion.region);
+          if (!intersection) {
+            error = "proven tiled consumer input region does not overlap its "
+                    "producer output region";
+            return false;
+          }
+          transferRegions[0] = std::move(intersection);
+          tileLocal = true;
+        }
+      } else if (operand_segment == TaskOperandSegment::WillReads &&
+                 consumerRegion.region && join &&
+                 indexed.index() < consumer.getOriginalReadMemrefs().size() &&
+                 isContainedIn(*consumerRegion.region, join.getRegionLower(),
+                               join.getRegionUpper())) {
+        Value consumerBase = consumer.getOriginalReadMemrefs()[indexed.index()];
+        SmallVector<std::optional<StaticRegion>> candidateRegions;
+        candidateRegions.reserve(producers.size());
+        bool completeRegionProof = true;
+        for (ProducerResult producer : producers) {
+          std::optional<ProducerWriteRegion> writeRegion =
+              getProducerWriteRegion(producer);
+          // The join base is the producer's incoming task state.  For an
+          // in-place task this can be another task result rather than the
+          // allocation itself.  Original memref provenance on both endpoint
+          // tasks is the canonical storage identity, so compare against the
+          // consumer root after requiring every joined producer to agree.
+          if (!writeRegion ||
+              !matchingOriginalMemrefRoot(writeRegion->base, consumerBase)) {
+            completeRegionProof = false;
+            break;
+          }
+          candidateRegions.push_back(
+              intersectRegions(writeRegion->region, *consumerRegion.region));
+        }
+        if (completeRegionProof) {
+          SmallVector<ProducerResult> intersectingProducers;
+          SmallVector<std::optional<StaticRegion>> intersections;
+          for (auto [producer, intersection] :
+               llvm::zip(producers, candidateRegions)) {
+            if (!intersection)
+              continue;
+            intersectingProducers.push_back(producer);
+            intersections.push_back(std::move(intersection));
+          }
+          if (intersectingProducers.empty()) {
+            error = "proven tiled consumer input region has no intersecting "
+                    "producer tile";
+            return false;
+          }
+          producers = std::move(intersectingProducers);
+          transferRegions = std::move(intersections);
+          tileLocal = true;
+        }
+      }
+
       struct ResolvedEdge {
         ProducerResult producer;
         TaskEdgeKind kind;
-        std::optional<uint64_t> payload;
+        PayloadFact payload;
+        std::optional<StaticRegion> transfer_region;
       };
       SmallVector<ResolvedEdge> resolvedEdges;
       uint64_t inferredPayloadSum = 0;
       bool completePayload = true;
       bool hasDataEdge = false;
-      for (ProducerResult producer : producers) {
+      for (auto [producerIndex, producer] : llvm::enumerate(producers)) {
         TaskEdgeKind kind = expected_kind;
         if (operand_segment == TaskOperandSegment::WillReads &&
             producer.segment != TaskResultSegment::DoneWrites) {
@@ -425,41 +863,56 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
         }
         if (operand_segment == TaskOperandSegment::ValueInputs &&
             producer.segment != TaskResultSegment::ValueOutputs) {
-          error = "value_inputs operand must resolve to value_outputs results";
-          return false;
+          // Older Taskflow producers use a done_reads/done_writes result as
+          // an SSA sequencing token in value_inputs.  It carries no scalar
+          // value and must not become a communication transport, but it still
+          // supplies real precedence.  Preserve that contract as a canonical
+          // Taskflow control edge instead of rejecting it or pretending the
+          // referenced memory object is value payload.
+          kind = TaskEdgeKind::Control;
         }
-        std::optional<uint64_t> payload;
+        PayloadFact payload;
         if (kind == TaskEdgeKind::Value || kind == TaskEdgeKind::Raw) {
           hasDataEdge = true;
-          payload = getProducerPayloadBits(producer);
-          if (!payload)
+          payload = tileLocal
+                        ? getRegionPayloadFact(producer.value.getType(),
+                                               *transferRegions[producerIndex])
+                        : getProducerPayloadFact(producer);
+          if (!payload.bits)
             completePayload = false;
-          else if (*payload > UINT64_MAX - inferredPayloadSum) {
+          else if (*payload.bits > UINT64_MAX - inferredPayloadSum) {
             error = "joined task payload sum overflows unsigned 64-bit bits";
             return false;
           } else {
-            inferredPayloadSum += *payload;
+            inferredPayloadSum += *payload.bits;
           }
         }
-        resolvedEdges.push_back({producer, kind, payload});
+        resolvedEdges.push_back(
+            {producer, kind, payload, transferRegions[producerIndex]});
       }
 
-      std::optional<uint64_t> explicitPayload;
+      ExplicitPayloadFact explicitPayload;
       if (hasDataEdge)
         explicitPayload = getExplicitPayloadBits(consumer, operand_segment,
                                                  indexed.index(), error);
       if (!error.empty())
         return false;
-      if (explicitPayload) {
+      if (explicitPayload.present) {
         if (resolvedEdges.size() == 1) {
-          if (resolvedEdges.front().payload &&
-              *resolvedEdges.front().payload != *explicitPayload) {
-            error = "amoeba.edge_payload_bits disagrees with the static "
-                    "payload type or transferred region";
+          PayloadFact &payload = resolvedEdges.front().payload;
+          if (explicitPayload.bits &&
+              payload.source == PayloadSource::ProvenTiledRegion &&
+              payload.bits && *payload.bits != *explicitPayload.bits) {
+            error = "amoeba.edge_payload_bits disagrees with the proven "
+                    "transferred region";
             return false;
           }
-          resolvedEdges.front().payload = explicitPayload;
-        } else if (!completePayload || inferredPayloadSum != *explicitPayload) {
+          payload = {explicitPayload.bits, PayloadSource::Explicit};
+        } else if (!explicitPayload.bits) {
+          for (ResolvedEdge &resolved : resolvedEdges)
+            resolved.payload = {std::nullopt, PayloadSource::Explicit};
+        } else if (!completePayload ||
+                   inferredPayloadSum != *explicitPayload.bits) {
           error = "amoeba.edge_payload_bits cannot be partitioned across "
                   "taskflow.join producers";
           return false;
@@ -467,7 +920,11 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
       }
       for (const ResolvedEdge &resolved : resolvedEdges)
         if (!addEdge(resolved.producer, consumer, resolved.kind,
-                     operand_segment, indexed.index(), resolved.payload))
+                     operand_segment, indexed.index(), resolved.payload.bits,
+                     TaskEdgeOrigin::Taskflow,
+                     tileLocal ? TaskEdgeScope::TileLocal
+                               : TaskEdgeScope::TensorWide,
+                     resolved.transfer_region))
           return false;
     }
     return true;
@@ -523,8 +980,88 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
       ProducerResult control_source{producer, TaskResultSegment::None, 0,
                                     Value()};
       if (!addEdge(control_source, consumer, TaskEdgeKind::Control,
-                   TaskOperandSegment::Control, indexed.index(), std::nullopt))
+                   TaskOperandSegment::Control, indexed.index(), std::nullopt,
+                   TaskEdgeOrigin::Control, TaskEdgeScope::TensorWide,
+                   std::nullopt))
         return failure();
+    }
+  }
+
+  // Adds source-order memory precedence to the same canonical edge graph used
+  // by scheduling, priority, diagnostics, and trace serialization. An existing
+  // edge in the required direction already supplies precedence and is not
+  // duplicated. Ordering-only edges never become communication transports.
+  std::set<std::pair<unsigned, unsigned>> precedencePairs;
+  for (const TaskEdge &edge : graph.edges_) {
+    TaskflowTaskOp producer = edge.producer;
+    TaskflowTaskOp consumer = edge.consumer;
+    precedencePairs.insert({task_ids.lookup(producer.getOperation()),
+                            task_ids.lookup(consumer.getOperation())});
+  }
+
+  SmallVector<Value> memories;
+  for (TaskflowTaskOp task : graph.tasks_) {
+    for (Value memory : task.getOriginalReadMemrefs())
+      if (!llvm::is_contained(memories, memory))
+        memories.push_back(memory);
+    for (Value memory : task.getOriginalWriteMemrefs())
+      if (!llvm::is_contained(memories, memory))
+        memories.push_back(memory);
+  }
+  for (Value memory : memories) {
+    std::optional<std::pair<TaskflowTaskOp, uint32_t>> lastWriter;
+    SmallVector<std::pair<TaskflowTaskOp, uint32_t>> readersSinceWrite;
+    for (TaskflowTaskOp task : graph.tasks_) {
+      std::optional<uint32_t> readIndex =
+          firstMemoryIndex(task.getOriginalReadMemrefs(), memory);
+      std::optional<uint32_t> writeIndex =
+          firstMemoryIndex(task.getOriginalWriteMemrefs(), memory);
+      const bool reads = readIndex.has_value();
+      const bool writes = writeIndex.has_value();
+      if (!reads && !writes)
+        continue;
+
+      auto addMemoryOrderEdge = [&](TaskflowTaskOp producer,
+                                    uint32_t producerIndex, TaskEdgeKind kind,
+                                    TaskOperandSegment consumerSegment,
+                                    uint32_t consumerIndex) -> bool {
+        unsigned producerId = task_ids.lookup(producer.getOperation());
+        unsigned consumerId = task_ids.lookup(task.getOperation());
+        if (precedencePairs.count({producerId, consumerId}))
+          return true;
+        ProducerResult source{producer, TaskResultSegment::None, producerIndex,
+                              memory};
+        if (!addEdge(source, task, kind, consumerSegment, consumerIndex,
+                     std::nullopt, TaskEdgeOrigin::MemoryOrder,
+                     TaskEdgeScope::TensorWide, std::nullopt))
+          return false;
+        precedencePairs.insert({producerId, consumerId});
+        return true;
+      };
+
+      if (lastWriter && !haveDisjointAccessRegions(lastWriter->first, task,
+                                                   reads, writes, memory)) {
+        if (!addMemoryOrderEdge(lastWriter->first, lastWriter->second,
+                                reads ? TaskEdgeKind::Raw : TaskEdgeKind::Waw,
+                                reads ? TaskOperandSegment::WillReads
+                                      : TaskOperandSegment::WillWrites,
+                                reads ? *readIndex : *writeIndex))
+          return failure();
+      }
+      if (writes) {
+        for (auto [reader, readerIndex] : readersSinceWrite) {
+          if (haveDisjointAccessRegions(task, reader, /*otherReads=*/true,
+                                        /*otherWrites=*/false, memory))
+            continue;
+          if (!addMemoryOrderEdge(reader, readerIndex, TaskEdgeKind::War,
+                                  TaskOperandSegment::WillWrites, *writeIndex))
+            return failure();
+        }
+        readersSinceWrite.clear();
+        lastWriter = std::make_pair(task, *writeIndex);
+      } else {
+        readersSinceWrite.push_back({task, *readIndex});
+      }
     }
   }
   return graph;
